@@ -521,7 +521,7 @@ MTL::BlendFactor ToMetalBlendFactorAlpha(xenos::BlendFactor blend_factor) {
 }  // namespace
 
 std::string MetalCommandProcessor::DescribeMslPipelineRequest(
-    const MslPipelineCompileRequest& request) {
+    const MetalCommandProcessor::MslPipelineCompileRequest& request) {
   return fmt::format(
       "key=0x{:016X} vs=0x{:016X}/0x{:016X} ps=0x{:016X}/0x{:016X} "
       "samples={} rt=[{},{},{},{}] depth={} stencil={} color_mask=0x{:08X} "

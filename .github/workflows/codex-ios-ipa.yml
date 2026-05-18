@@ -95,13 +95,14 @@ jobs:
           build_number="${BUILD_NUMBER_INPUT:-9288.1}"
           ios_min="${IOS_MIN_INPUT:-16.0}"
 
+          mkdir -p scratch/artifacts
           tools/build_apple_release.sh \
             --skip-macos-arm64 \
             --skip-macos-x86_64 \
             --config release \
             --version "${version}" \
             --build-number "${build_number}" \
-            --ios-min "${ios_min}"
+            --ios-min "${ios_min}" 2>&1 | tee scratch/artifacts/codex_ios_build.log
 
           test -f scratch/artifacts/xenios_ios_iphone_ipad.ipa
 
@@ -111,4 +112,13 @@ jobs:
           name: xenios-ios-iphone-ipad-optimized
           path: scratch/artifacts/xenios_ios_iphone_ipad.ipa
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenios-ios-build-log
+          path: scratch/artifacts/codex_ios_build.log
+          if-no-files-found: ignore
           retention-days: 14
