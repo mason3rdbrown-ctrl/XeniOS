@@ -47,6 +47,7 @@
 #include "xenia/gpu/metal/metal_shader_cache.h"
 #include "xenia/gpu/packet_disassembler.h"
 #include "xenia/gpu/registers.h"
+#include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/texture_util.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
@@ -93,6 +94,21 @@ namespace gpu {
 namespace metal {
 
 namespace {
+constexpr size_t kVivaPinataDiagDrawLogLimit = 512;
+
+uint64_t VivaPinataDiagMix(uint64_t seed, uint64_t value) {
+  return seed ^
+         (value + UINT64_C(0x9E3779B97F4A7C15) + (seed << 6) + (seed >> 2));
+}
+
+bool VivaPinataDiagRemember(std::unordered_set<uint64_t>& logged,
+                            uint64_t tag) {
+  if (logged.size() >= kVivaPinataDiagDrawLogLimit) {
+    return false;
+  }
+  return logged.insert(tag).second;
+}
+
 bool UseSpirvCrossPath() {
 #if METAL_SHADER_CONVERTER_AVAILABLE
   return cvars::metal_use_spirvcross;
@@ -4272,10 +4288,124 @@ bool MetalCommandProcessor::IssueDrawMsl(
   }
 
   // Request textures used by the shaders.
-  uint32_t used_texture_mask =
+  uint32_t used_texture_mask_vertex =
       msl_vertex_shader->GetUsedTextureMaskAfterTranslation();
+  uint32_t used_texture_mask_pixel = 0;
   if (msl_pixel_shader) {
-    used_texture_mask |= msl_pixel_shader->GetUsedTextureMaskAfterTranslation();
+    used_texture_mask_pixel =
+        msl_pixel_shader->GetUsedTextureMaskAfterTranslation();
+  }
+  uint32_t used_texture_mask =
+      used_texture_mask_vertex | used_texture_mask_pixel;
+
+  if (::cvars::metal_viva_pinata_diagnostics) {
+    static std::unordered_set<uint64_t> logged_draws;
+    uint64_t fetch_hash = 0;
+    uint32_t remaining_fetch_bits = used_texture_mask;
+    uint32_t fetch_index = 0;
+    while (xe::bit_scan_forward(remaining_fetch_bits, &fetch_index)) {
+      remaining_fetch_bits &= ~(uint32_t(1) << fetch_index);
+      xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_index);
+      fetch_hash = VivaPinataDiagMix(fetch_hash, fetch_index);
+      fetch_hash = VivaPinataDiagMix(fetch_hash, fetch.dword_0);
+      fetch_hash = VivaPinataDiagMix(fetch_hash, fetch.dword_1);
+      fetch_hash = VivaPinataDiagMix(fetch_hash, fetch.dword_2);
+      fetch_hash = VivaPinataDiagMix(fetch_hash, fetch.dword_3);
+      fetch_hash = VivaPinataDiagMix(fetch_hash, fetch.dword_4);
+      fetch_hash = VivaPinataDiagMix(fetch_hash, fetch.dword_5);
+    }
+    uint64_t tag = vertex_translation->shader().ucode_data_hash();
+    tag = VivaPinataDiagMix(
+        tag,
+        pixel_translation ? pixel_translation->shader().ucode_data_hash() : 0);
+    tag = VivaPinataDiagMix(tag, vertex_translation->modification());
+    tag = VivaPinataDiagMix(
+        tag, pixel_translation ? pixel_translation->modification() : 0);
+    tag = VivaPinataDiagMix(tag, used_texture_mask);
+    tag = VivaPinataDiagMix(tag, fetch_hash);
+    tag = VivaPinataDiagMix(tag, uint64_t(memexport_used));
+    if (VivaPinataDiagRemember(logged_draws, tag)) {
+      XELOGI(
+          "VivaPinataDiagDraw: tag=0x{:016X} vs=0x{:016X} ps=0x{:016X} "
+          "vs_mod=0x{:016X} ps_mod=0x{:016X} textures=0x{:08X} "
+          "vs_textures=0x{:08X} ps_textures=0x{:08X} memexport={} "
+          "memexport_ranges={} tessellated={} color_mask=0x{:08X} "
+          "host_vertices={} polygonal={} rasterized={}",
+          tag, vertex_translation->shader().ucode_data_hash(),
+          pixel_translation ? pixel_translation->shader().ucode_data_hash() : 0,
+          vertex_translation->modification(),
+          pixel_translation ? pixel_translation->modification() : 0,
+          used_texture_mask, used_texture_mask_vertex, used_texture_mask_pixel,
+          memexport_used ? 1 : 0, memexport_ranges_.size(),
+          is_tessellated ? 1 : 0, normalized_color_mask,
+          primitive_processing_result.host_draw_vertex_count,
+          primitive_polygonal ? 1 : 0, is_rasterization_done ? 1 : 0);
+
+      for (size_t i = 0; i < memexport_ranges_.size() && i < 6; ++i) {
+        const draw_util::MemExportRange& range = memexport_ranges_[i];
+        XELOGI(
+            "VivaPinataDiagMemExport: draw=0x{:016X} range={} "
+            "base=0x{:08X} size={}",
+            tag, i, range.base_address_dwords << 2, range.size_bytes);
+      }
+
+      remaining_fetch_bits = used_texture_mask;
+      while (xe::bit_scan_forward(remaining_fetch_bits, &fetch_index)) {
+        remaining_fetch_bits &= ~(uint32_t(1) << fetch_index);
+        xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_index);
+        if (fetch.type != xenos::FetchConstantType::kTexture &&
+            (fetch.type != xenos::FetchConstantType::kInvalidTexture ||
+             !::cvars::gpu_allow_invalid_fetch_constants)) {
+          XELOGI(
+              "VivaPinataDiagFetch: draw=0x{:016X} fetch={} type={} "
+              "invalid dwords={:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+              tag, fetch_index, uint32_t(fetch.type), fetch.dword_0,
+              fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+              fetch.dword_5);
+          continue;
+        }
+        uint32_t width_minus_1 = 0;
+        uint32_t height_minus_1 = 0;
+        uint32_t depth_or_array_size_minus_1 = 0;
+        uint32_t base_page = 0;
+        uint32_t mip_page = 0;
+        uint32_t mip_min_level = 0;
+        uint32_t mip_max_level = 0;
+        texture_util::GetSubresourcesFromFetchConstant(
+            fetch, &width_minus_1, &height_minus_1,
+            &depth_or_array_size_minus_1, &base_page, &mip_page, &mip_min_level,
+            &mip_max_level);
+        texture_util::TextureGuestLayout layout =
+            texture_util::GetGuestTextureLayout(
+                fetch.dimension, fetch.pitch, width_minus_1 + 1,
+                height_minus_1 + 1, depth_or_array_size_minus_1 + 1,
+                fetch.tiled, fetch.format, fetch.packed_mips, base_page != 0,
+                mip_max_level);
+        xenos::TextureFormat base_format = GetBaseFormat(fetch.format);
+        XELOGI(
+            "VivaPinataDiagFetch: draw=0x{:016X} fetch={} vs={} ps={} "
+            "format={}({}) base_format={}({}) size={}x{}x{} dim={} "
+            "pitch={} tiled={} endian={} packed_mips={} mip_min={} "
+            "mip_max={} base_page=0x{:05X} mip_page=0x{:05X} "
+            "base_bytes={} mips_bytes={} base_row_pitch={} "
+            "base_extent={}x{}x{} swizzle=0x{:08X} dwords={:08X} {:08X} "
+            "{:08X} {:08X} {:08X} {:08X}",
+            tag, fetch_index,
+            (used_texture_mask_vertex & (uint32_t(1) << fetch_index)) ? 1 : 0,
+            (used_texture_mask_pixel & (uint32_t(1) << fetch_index)) ? 1 : 0,
+            uint32_t(fetch.format), FormatInfo::GetName(fetch.format),
+            uint32_t(base_format), FormatInfo::GetName(base_format),
+            width_minus_1 + 1, height_minus_1 + 1,
+            depth_or_array_size_minus_1 + 1, uint32_t(fetch.dimension),
+            fetch.pitch, fetch.tiled ? 1 : 0, uint32_t(fetch.endianness),
+            fetch.packed_mips ? 1 : 0, mip_min_level, mip_max_level, base_page,
+            mip_page, layout.base.level_data_extent_bytes,
+            layout.mips_total_extent_bytes, layout.base.row_pitch_bytes,
+            layout.base.x_extent_blocks, layout.base.y_extent_blocks,
+            layout.base.z_extent, fetch.swizzle, fetch.dword_0, fetch.dword_1,
+            fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+      }
+    }
   }
 
   if (copy_resolve_writes_pending_ && used_texture_mask) {

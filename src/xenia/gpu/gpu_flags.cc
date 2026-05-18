@@ -132,6 +132,10 @@ DEFINE_bool(metal_texture_upload_via_blit, true,
             "Upload textures via staging buffers and GPU blit copies instead "
             "of CPU replaceRegion.",
             "GPU");
+DEFINE_bool(metal_viva_pinata_diagnostics, false,
+            "Log targeted Metal texture, shader, and resolve diagnostics for "
+            "Viva Pinata rendering corruption investigation.",
+            "GPU");
 
 // On iOS, Metal Shader Converter is unavailable, so use SPIRV-Cross.
 // On macOS, prefer the MSC path by default.

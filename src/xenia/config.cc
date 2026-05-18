@@ -54,6 +54,36 @@ std::filesystem::path GetBundledDataPath(const std::string& subdirectory) {
   return xe::filesystem::GetExecutablePath().parent_path() / subdirectory;
 }
 
+template <typename T>
+bool SetBuiltInGameConfigValue(const char* cvar_name, T value) {
+  if (!cvar::ConfigVars) {
+    return false;
+  }
+  auto it = cvar::ConfigVars->find(cvar_name);
+  if (it == cvar::ConfigVars->end()) {
+    return false;
+  }
+  auto* config_var = dynamic_cast<cvar::ConfigVar<T>*>(it->second);
+  if (!config_var) {
+    return false;
+  }
+  config_var->SetGameConfigValue(value);
+  return true;
+}
+
+void ApplyBuiltInTitleConfig(uint32_t title_id) {
+  // Viva Pinata: enable diagnostics for the Metal texture/resolve paths without
+  // requiring a user-created per-game config. A real per-game config loaded
+  // below can still override this value.
+  constexpr uint32_t kVivaPinataTitleId = 0x4D5307F2;
+  if (title_id != kVivaPinataTitleId) {
+    return;
+  }
+  if (SetBuiltInGameConfigValue("metal_viva_pinata_diagnostics", true)) {
+    XELOGI("Applied built-in Viva Pinata Metal diagnostics config");
+  }
+}
+
 bool sortCvar(cvar::IConfigVar* a, cvar::IConfigVar* b) {
   if (a->category() < b->category()) return true;
   if (a->category() > b->category()) return false;
@@ -261,6 +291,7 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
   // Load the game config directly into cvars.
   auto title_id_str = fmt::format("{:08X}", title_id);
   const auto game_config_path = GetGameConfigPath(title_id_str);
+  ApplyBuiltInTitleConfig(title_id);
 
   if (!std::filesystem::exists(game_config_path)) {
     return title_id;

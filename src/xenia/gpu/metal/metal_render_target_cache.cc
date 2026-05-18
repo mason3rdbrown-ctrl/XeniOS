@@ -78,6 +78,20 @@ namespace gpu {
 namespace metal {
 
 namespace {
+constexpr size_t kVivaPinataDiagResolveLogLimit = 256;
+
+uint64_t VivaPinataDiagMix(uint64_t seed, uint64_t value) {
+  return seed ^
+         (value + UINT64_C(0x9E3779B97F4A7C15) + (seed << 6) + (seed >> 2));
+}
+
+bool VivaPinataDiagRemember(std::unordered_set<uint64_t>& logged,
+                            uint64_t tag) {
+  if (logged.size() >= kVivaPinataDiagResolveLogLimit) {
+    return false;
+  }
+  return logged.insert(tag).second;
+}
 
 class ScopedAutoreleasePool {
  public:
@@ -4744,6 +4758,62 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
         ++missing_scaled_pipeline_log_count;
         XELOGW("MetalResolve: scaled resolve pipeline missing for shader {}",
                int(copy_shader));
+      }
+    }
+
+    if (::cvars::metal_viva_pinata_diagnostics) {
+      static std::unordered_set<uint64_t> logged_resolves;
+      draw_util::ResolveEdramInfo edram_info =
+          is_depth ? resolve_info.depth_edram_info
+                   : resolve_info.color_edram_info;
+      uint64_t tag = uint64_t(resolve_info.copy_dest_base);
+      tag = VivaPinataDiagMix(tag, resolve_info.copy_dest_extent_start);
+      tag = VivaPinataDiagMix(tag, resolve_info.copy_dest_extent_length);
+      tag = VivaPinataDiagMix(
+          tag, uint32_t(resolve_info.copy_dest_info.copy_dest_format));
+      tag = VivaPinataDiagMix(tag, resolve_info.coordinate_info.packed);
+      tag =
+          VivaPinataDiagMix(tag, resolve_info.copy_dest_coordinate_info.packed);
+      tag = VivaPinataDiagMix(tag, edram_info.packed);
+      tag = VivaPinataDiagMix(tag, uint64_t(copy_shader));
+      tag = VivaPinataDiagMix(tag, uint64_t(pipeline != nullptr));
+      size_t copy_shader_index = size_t(copy_shader);
+      const char* copy_shader_name =
+          copy_shader_index < size_t(draw_util::ResolveCopyShaderIndex::kCount)
+              ? draw_util::resolve_copy_shader_info[copy_shader_index]
+                    .debug_name
+              : "unknown";
+      if (VivaPinataDiagRemember(logged_resolves, tag)) {
+        XELOGI(
+            "VivaPinataDiagResolve: tag=0x{:016X} depth={} clear_depth={} "
+            "clear_color={} dest_base=0x{:08X} dest_start=0x{:08X} "
+            "dest_len={} dest_local=[0x{:X},0x{:X}) copy_format={}({}) "
+            "copy_swap={} dest_pitch={} dest_height={} dest_offset={}x{} "
+            "resolve_size={}x{} scale={}x{} copy_shader={}({}) "
+            "pipeline={} groups={}x{} edram_base={} edram_pitch={} "
+            "edram_msaa={} edram_format={} edram_64bpp={} "
+            "dump_base={} dump_row_len={} dump_rows={} dump_pitch={}",
+            tag, is_depth ? 1 : 0, resolve_info.IsClearingDepth() ? 1 : 0,
+            resolve_info.IsClearingColor() ? 1 : 0, resolve_info.copy_dest_base,
+            resolve_info.copy_dest_extent_start,
+            resolve_info.copy_dest_extent_length, dest_local_start,
+            dest_local_end,
+            uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+            FormatInfo::GetName(
+                uint32_t(resolve_info.copy_dest_info.copy_dest_format)),
+            uint32_t(resolve_info.copy_dest_info.copy_dest_swap),
+            resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 << 5,
+            resolve_info.copy_dest_coordinate_info.height_aligned_div_32 << 5,
+            resolve_info.copy_dest_coordinate_info.offset_x_div_8 << 3,
+            resolve_info.copy_dest_coordinate_info.offset_y_div_8 << 3,
+            resolve_width, resolve_height,
+            resolve_info.coordinate_info.draw_resolution_scale_x,
+            resolve_info.coordinate_info.draw_resolution_scale_y,
+            uint32_t(copy_shader), copy_shader_name, pipeline ? 1 : 0,
+            group_count_x, group_count_y, edram_info.base_tiles,
+            edram_info.pitch_tiles, uint32_t(edram_info.msaa_samples),
+            edram_info.format, edram_info.format_is_64bpp ? 1 : 0, dump_base,
+            dump_row_length_used, dump_rows, dump_pitch);
       }
     }
 

@@ -125,6 +125,21 @@ struct MetalLoadConstants {
 };
 static_assert(sizeof(MetalLoadConstants) == 64);
 
+constexpr size_t kVivaPinataDiagTextureLogLimit = 512;
+
+uint64_t VivaPinataDiagMix(uint64_t seed, uint64_t value) {
+  return seed ^
+         (value + UINT64_C(0x9E3779B97F4A7C15) + (seed << 6) + (seed >> 2));
+}
+
+bool VivaPinataDiagRemember(std::unordered_set<uint64_t>& logged,
+                            uint64_t tag) {
+  if (logged.size() >= kVivaPinataDiagTextureLogLimit) {
+    return false;
+  }
+  return logged.insert(tag).second;
+}
+
 class ScopedAutoreleasePool {
  public:
   ScopedAutoreleasePool() : pool_(NS::AutoreleasePool::alloc()->init()) {}
@@ -1029,6 +1044,71 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   }
 
   const bool use_blit_upload = ShouldUploadViaBlit();
+
+  if (::cvars::metal_viva_pinata_diagnostics) {
+    static std::unordered_set<uint64_t> logged_texture_loads;
+    uint64_t tag = TextureKey::Hasher{}(key);
+    tag = VivaPinataDiagMix(tag, uint64_t(load_base));
+    tag = VivaPinataDiagMix(tag, uint64_t(load_mips));
+    tag = VivaPinataDiagMix(tag, uint64_t(texture_resolution_scaled));
+    tag = VivaPinataDiagMix(tag, uint64_t(load_shader));
+    tag = VivaPinataDiagMix(tag, dest_buffer_size);
+    if (VivaPinataDiagRemember(logged_texture_loads, tag)) {
+      MTL::Texture* host_texture = metal_texture->metal_texture();
+      xenos::TextureFormat base_format = GetBaseFormat(key.format);
+      XELOGI(
+          "VivaPinataDiagTextureLoad: key=0x{:016X} format={}({}) "
+          "base_format={}({}) size={}x{}x{} dim={} tiled={} 3d_tiling={} "
+          "endian={} pitch={} mips={} packed_mips={} packed_level=0x{:08X} "
+          "base_page=0x{:05X} mip_page=0x{:05X} load_base={} load_mips={} "
+          "load_shader={} decompress={} host_bc={} host_pixel_format={} "
+          "host_size={}x{}x{} scaled={} scale={}x{} upload_blit={} "
+          "guest_base_bytes={} guest_mips_bytes={} dest_bytes={}",
+          tag, uint32_t(key.format), FormatInfo::GetName(key.format),
+          uint32_t(base_format), FormatInfo::GetName(base_format), width,
+          height, depth_or_array_size, uint32_t(dimension), key.tiled ? 1 : 0,
+          is_3d_tiling ? 1 : 0, uint32_t(key.endianness), key.pitch,
+          key.mip_max_level + 1, key.packed_mips ? 1 : 0, level_packed,
+          key.base_page, key.mip_page, load_base ? 1 : 0, load_mips ? 1 : 0,
+          uint32_t(load_shader), decompress ? 1 : 0,
+          host_block_compressed ? 1 : 0,
+          host_texture ? uint32_t(host_texture->pixelFormat()) : 0,
+          host_texture ? uint32_t(host_texture->width()) : 0,
+          host_texture ? uint32_t(host_texture->height()) : 0,
+          host_texture ? uint32_t(host_texture->depth()) : 0,
+          texture_resolution_scaled ? 1 : 0, texture_resolution_scale_x,
+          texture_resolution_scale_y, use_blit_upload ? 1 : 0,
+          guest_layout.base.level_data_extent_bytes,
+          guest_layout.mips_total_extent_bytes, dest_buffer_size);
+
+      uint32_t logged_levels = 0;
+      for (const StoredLevelHostLayout& stored_level : stored_levels) {
+        if (logged_levels >= 6) {
+          break;
+        }
+        const texture_util::TextureGuestLayout::Level& level_guest_layout =
+            stored_level.is_base ? guest_layout.base
+                                 : guest_layout.mips[stored_level.level];
+        XELOGI(
+            "VivaPinataDiagTextureLevel: key=0x{:016X} storage={} "
+            "level={} host_offset={} host_slice_bytes={} host_row_pitch={} "
+            "host_height_blocks={} host_depth={} host_size={}x{} "
+            "guest_row_pitch={} guest_z_stride_rows={} guest_extent={}x{}x{} "
+            "guest_array_stride={} guest_data_bytes={}",
+            tag, stored_level.is_base ? "base" : "mip", stored_level.level,
+            stored_level.dest_offset_bytes, stored_level.slice_size_bytes,
+            stored_level.row_pitch_bytes, stored_level.height_blocks,
+            stored_level.depth_slices, stored_level.width_texels,
+            stored_level.height_texels, level_guest_layout.row_pitch_bytes,
+            level_guest_layout.z_slice_stride_block_rows,
+            level_guest_layout.x_extent_blocks,
+            level_guest_layout.y_extent_blocks, level_guest_layout.z_extent,
+            level_guest_layout.array_slice_stride_bytes,
+            level_guest_layout.level_data_extent_bytes);
+        ++logged_levels;
+      }
+    }
+  }
 
   auto find_stored_level =
       [&](bool is_base_storage,
@@ -2486,6 +2566,36 @@ MTL::Texture* MetalTextureCache::GetTextureForBinding(
                                               is_signed);
     }
   }
+
+  if (::cvars::metal_viva_pinata_diagnostics && result) {
+    static std::unordered_set<uint64_t> logged_texture_bindings;
+    uint64_t tag = TextureKey::Hasher{}(binding->key);
+    tag = VivaPinataDiagMix(tag, fetch_constant);
+    tag = VivaPinataDiagMix(tag, uint64_t(dimension));
+    tag = VivaPinataDiagMix(tag, uint64_t(is_signed));
+    tag = VivaPinataDiagMix(tag, binding->host_swizzle);
+    tag = VivaPinataDiagMix(tag, uint64_t(result->pixelFormat()));
+    if (VivaPinataDiagRemember(logged_texture_bindings, tag)) {
+      const TextureKey& bind_key = binding->key;
+      XELOGI(
+          "VivaPinataDiagTextureBind: fetch={} format={}({}) size={}x{}x{} "
+          "dim={} requested_dim={} signed={} tiled={} endian={} pitch={} "
+          "mips={} packed_mips={} base_page=0x{:05X} mip_page=0x{:05X} "
+          "host_swizzle=0x{:08X} use_3d_as_2d={} host_pixel_format={} "
+          "host_size={}x{}x{}",
+          fetch_constant, uint32_t(bind_key.format),
+          FormatInfo::GetName(bind_key.format), bind_key.GetWidth(),
+          bind_key.GetHeight(), bind_key.GetDepthOrArraySize(),
+          uint32_t(bind_key.dimension), uint32_t(dimension), is_signed ? 1 : 0,
+          bind_key.tiled ? 1 : 0, uint32_t(bind_key.endianness), bind_key.pitch,
+          bind_key.mip_max_level + 1, bind_key.packed_mips ? 1 : 0,
+          bind_key.base_page, bind_key.mip_page, binding->host_swizzle,
+          use_3d_as_2d ? 1 : 0, uint32_t(result->pixelFormat()),
+          uint32_t(result->width()), uint32_t(result->height()),
+          uint32_t(result->depth()));
+    }
+  }
+
   return result ? result : get_null_texture_for_dimension();
 }
 
