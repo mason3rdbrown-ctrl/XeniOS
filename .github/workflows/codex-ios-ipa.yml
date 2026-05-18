@@ -1,0 +1,114 @@
+name: Codex iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Marketing version"
+        required: false
+        default: "1.0.1"
+        type: string
+      build_number:
+        description: "Build number"
+        required: false
+        default: "9288.1"
+        type: string
+      ios_min:
+        description: "Minimum iOS version"
+        required: false
+        default: "16.0"
+        type: string
+  push:
+    branches:
+      - "codex/ios-optimized-fork"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "codex-ios-ipa-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build-ios-ipa:
+    name: Build iOS IPA
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode.app ]; then
+            sudo xcode-select -s /Applications/Xcode.app
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install sdl2 ninja
+          chmod +x xb xenia-build.py tools/build_apple_release.sh
+
+      - name: Fetch submodules and data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local attempts=0
+            until "$@"; do
+              attempts=$((attempts + 1))
+              if [ "$attempts" -ge 5 ]; then
+                return 1
+              fi
+              sleep 10
+            done
+          }
+
+          retry git submodule update --init --depth=1 -j"$(sysctl -n hw.ncpu)" \
+            $(grep -oE 'path = .+' .gitmodules | sed 's/path = //' | grep -v 'premake-androidndk\|premake-export-compile-commands')
+          retry git -C third_party/DirectXShaderCompiler submodule update --init --depth=1 \
+            external/SPIRV-Headers external/SPIRV-Tools
+
+          python3 xenia-build.py premake
+          python3 xenia-build.py fetchdata
+
+      - name: Build ad-hoc signed IPA
+        shell: bash
+        env:
+          VERSION_INPUT: "${{ github.event.inputs.version }}"
+          BUILD_NUMBER_INPUT: "${{ github.event.inputs.build_number }}"
+          IOS_MIN_INPUT: "${{ github.event.inputs.ios_min }}"
+        run: |
+          set -euo pipefail
+
+          version="${VERSION_INPUT:-1.0.1}"
+          build_number="${BUILD_NUMBER_INPUT:-9288.1}"
+          ios_min="${IOS_MIN_INPUT:-16.0}"
+
+          tools/build_apple_release.sh \
+            --skip-macos-arm64 \
+            --skip-macos-x86_64 \
+            --config release \
+            --version "${version}" \
+            --build-number "${build_number}" \
+            --ios-min "${ios_min}"
+
+          test -f scratch/artifacts/xenios_ios_iphone_ipad.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenios-ios-iphone-ipad-optimized
+          path: scratch/artifacts/xenios_ios_iphone_ipad.ipa
+          if-no-files-found: error
+          retention-days: 14
