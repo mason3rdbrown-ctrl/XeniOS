@@ -15,6 +15,7 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/render_target_cache.h"
