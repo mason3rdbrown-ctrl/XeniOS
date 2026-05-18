@@ -348,6 +348,104 @@ static std::string JoinStringList(const std::vector<std::string>& values) {
   return joined;
 }
 
+static std::string NsStringToUtf8(NS::String* value) {
+  return value && value->utf8String() ? value->utf8String() : "<null>";
+}
+
+static std::string DescribeMetalError(NS::Error* error) {
+  if (!error) {
+    return "unknown Metal error";
+  }
+  std::string user_info = "<null>";
+  if (NS::Dictionary* info = error->userInfo()) {
+    user_info = NsStringToUtf8(info->description());
+  }
+  return fmt::format("domain={} code={} desc='{}' failure='{}' recovery='{}' "
+                     "userInfo='{}'",
+                     NsStringToUtf8(error->domain()), error->code(),
+                     NsStringToUtf8(error->localizedDescription()),
+                     NsStringToUtf8(error->localizedFailureReason()),
+                     NsStringToUtf8(error->localizedRecoverySuggestion()),
+                     user_info);
+}
+
+static std::filesystem::path GetMslDiagnosticDumpDirectory() {
+  std::filesystem::path dump_dir;
+  {
+    std::lock_guard<std::mutex> lock(g_msl_source_cache_mutex);
+    if (!g_msl_source_cache_directory.empty()) {
+      dump_dir = g_msl_source_cache_directory / "failures";
+    }
+  }
+  if (dump_dir.empty() && !cvars::dump_shaders.empty()) {
+    dump_dir = std::filesystem::absolute(cvars::dump_shaders) / "msl_shaders" /
+               "failures";
+  }
+  if (dump_dir.empty()) {
+    std::error_code ec;
+    dump_dir = std::filesystem::temp_directory_path(ec) / "xenia_msl_failures";
+    if (ec) {
+      dump_dir = std::filesystem::path("xenia_msl_failures");
+    }
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(dump_dir, ec);
+  if (ec) {
+    XELOGW("MslShader: Failed to create diagnostic dump directory {}: {}",
+           dump_dir.string(), ec.message());
+    return {};
+  }
+  return dump_dir;
+}
+
+static std::filesystem::path DumpMslDiagnosticData(const void* data,
+                                                   size_t size,
+                                                   uint64_t shader_hash,
+                                                   uint64_t modification,
+                                                   xenos::ShaderType shader_type,
+                                                   const char* reason,
+                                                   const char* extension) {
+  if (!data || !size || !reason || !extension) {
+    return {};
+  }
+  std::filesystem::path dump_dir = GetMslDiagnosticDumpDirectory();
+  if (dump_dir.empty()) {
+    return {};
+  }
+  const char* stage_tag =
+      shader_type == xenos::ShaderType::kVertex ? "vs" : "ps";
+  std::filesystem::path dump_path =
+      dump_dir /
+      fmt::format("{}_{:016X}_mod{:016X}_{}.{}", stage_tag, shader_hash,
+                  modification, reason, extension);
+  FILE* f = xe::filesystem::OpenFile(dump_path, "wb");
+  if (!f) {
+    XELOGW("MslShader: Failed to open diagnostic dump file {}",
+           dump_path.string());
+    return {};
+  }
+  fwrite(data, 1, size, f);
+  fclose(f);
+  return dump_path;
+}
+
+static std::filesystem::path DumpMslDiagnosticSource(
+    const std::string& msl_source, uint64_t shader_hash, uint64_t modification,
+    xenos::ShaderType shader_type, const char* reason) {
+  return DumpMslDiagnosticData(msl_source.data(), msl_source.size(),
+                               shader_hash, modification, shader_type, reason,
+                               "metal");
+}
+
+static std::filesystem::path DumpMslDiagnosticSpirv(
+    const std::vector<uint8_t>& spirv_data, uint64_t shader_hash,
+    uint64_t modification, xenos::ShaderType shader_type, const char* reason) {
+  return DumpMslDiagnosticData(spirv_data.data(), spirv_data.size(),
+                               shader_hash, modification, shader_type, reason,
+                               "spv");
+}
+
 static void AddEntryPointCandidatesFromMslSource(
     const std::string& msl_source, xenos::ShaderType shader_type,
     std::vector<std::string>* candidates) {
@@ -405,44 +503,6 @@ static void AddEntryPointCandidatesFromMslSource(
       candidates->push_back(name);
     }
   }
-}
-
-static void DumpMslResolveFailureSource(const std::string& msl_source,
-                                        uint64_t shader_hash,
-                                        uint64_t modification,
-                                        xenos::ShaderType shader_type) {
-  if (msl_source.empty()) {
-    return;
-  }
-  const char* stage_tag =
-      shader_type == xenos::ShaderType::kVertex ? "vs" : "ps";
-  std::filesystem::path dump_dir;
-  if (!cvars::dump_shaders.empty()) {
-    dump_dir = std::filesystem::absolute(cvars::dump_shaders) / "msl_shaders" /
-               "failures";
-  } else {
-    dump_dir = std::filesystem::temp_directory_path() / "xenia_msl_failures";
-  }
-  std::error_code ec;
-  std::filesystem::create_directories(dump_dir, ec);
-  if (ec) {
-    XELOGW("MslShader: Failed to create unresolved-entry dump directory {}: {}",
-           dump_dir.string(), ec.message());
-    return;
-  }
-  std::filesystem::path dump_path =
-      dump_dir / fmt::format("{}_{:016X}_mod{:016X}_entry_resolve_fail.metal",
-                             stage_tag, shader_hash, modification);
-  FILE* f = xe::filesystem::OpenFile(dump_path, "w");
-  if (!f) {
-    XELOGW("MslShader: Failed to open unresolved-entry dump file {}",
-           dump_path.string());
-    return;
-  }
-  fwrite(msl_source.data(), 1, msl_source.size(), f);
-  fclose(f);
-  XELOGW("MslShader: Dumped unresolved-entry MSL source to {}",
-         dump_path.string());
 }
 
 static void AddResourceBindings(
@@ -641,8 +701,13 @@ static void AddResourceBindings(
 }
 
 bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
+  last_compile_error_.clear();
+  last_diagnostic_msl_path_.clear();
+  last_diagnostic_spirv_path_.clear();
   if (!device) {
-    XELOGE("MslShader: No Metal device provided");
+    last_compile_error_ = "no Metal device provided";
+    XELOGE("MslShader: No Metal device provided shader={:016X} mod={:016X}",
+           shader().ucode_data_hash(), modification());
     return false;
   }
   if (argument_encoder_) {
@@ -655,9 +720,34 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
 
   const std::vector<uint8_t>& spirv_data = translated_binary();
   if (spirv_data.empty()) {
-    XELOGE("MslShader: No translated SPIR-V data available");
+    last_compile_error_ = "no translated SPIR-V data available";
+    XELOGE("MslShader: No translated SPIR-V data available shader={:016X} "
+           "mod={:016X}",
+           shader().ucode_data_hash(), modification());
     return false;
   }
+  auto dump_spirv_for_failure = [&](const char* reason) {
+    if (last_diagnostic_spirv_path_.empty()) {
+      last_diagnostic_spirv_path_ = DumpMslDiagnosticSpirv(
+          spirv_data, shader().ucode_data_hash(), modification(),
+          shader().type(), reason);
+      if (!last_diagnostic_spirv_path_.empty()) {
+        XELOGW("MslShader: Dumped diagnostic SPIR-V to {}",
+               last_diagnostic_spirv_path_.string());
+      }
+    }
+  };
+  auto dump_msl_for_failure = [&](const char* reason) {
+    if (!msl_source_.empty() && last_diagnostic_msl_path_.empty()) {
+      last_diagnostic_msl_path_ = DumpMslDiagnosticSource(
+          msl_source_, shader().ucode_data_hash(), modification(),
+          shader().type(), reason);
+      if (!last_diagnostic_msl_path_.empty()) {
+        XELOGW("MslShader: Dumped diagnostic MSL to {}",
+               last_diagnostic_msl_path_.string());
+      }
+    }
+  };
   const size_t spirv_size_bytes = spirv_data.size();
   if (spirv_size_bytes >= 64 * 1024) {
     XELOGW(
@@ -676,7 +766,12 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
 
   // SPIR-V data is a vector of bytes, but SPIRV-Cross expects uint32_t words.
   if (spirv_data.size() % sizeof(uint32_t) != 0) {
-    XELOGE("MslShader: SPIR-V data size is not aligned to 4 bytes");
+    last_compile_error_ =
+        fmt::format("SPIR-V data size {} is not aligned to 4 bytes",
+                    spirv_data.size());
+    dump_spirv_for_failure("bad_spirv_size");
+    XELOGE("MslShader: {} shader={:016X} mod={:016X}", last_compile_error_,
+           shader().ucode_data_hash(), modification());
     return false;
   }
   const uint32_t* spirv_words =
@@ -1117,13 +1212,24 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
           MslBindings::kTessellationConstants);
     }
     if (texture_count > MslTextureIndex::kMaxPerStage) {
-      XELOGE(
-          "MslShader: Shader uses {} textures, exceeding Metal's {}-per-stage "
-          "limit in this backend",
+      last_compile_error_ = fmt::format(
+          "shader uses {} textures, exceeding Metal backend limit {}",
           texture_count, MslTextureIndex::kMaxPerStage);
+      dump_spirv_for_failure("texture_limit");
+      XELOGE("MslShader: {} shader={:016X} stage={} mod={:016X}",
+             last_compile_error_, shader().ucode_data_hash(),
+             GetExecutionModelName(execution_model), modification());
       return false;
     }
     if (sampler_count > 16) {
+      last_compile_error_ = fmt::format(
+          "shader uses {} SPIR-V samplers, exceeding Metal's 16-per-stage "
+          "limit",
+          sampler_count);
+      dump_spirv_for_failure("sampler_limit");
+      XELOGE("MslShader: {} shader={:016X} stage={} mod={:016X}",
+             last_compile_error_, shader().ucode_data_hash(),
+             GetExecutionModelName(execution_model), modification());
       XELOGE(
           "MslShader: Shader uses {} samplers, exceeding Metal's 16-per-stage "
           "limit — translation should be considered failed",
@@ -1147,7 +1253,18 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
     try {
       msl_source_ = compiler.compile();
     } catch (const std::exception& e) {
-      XELOGE("MslShader: SPIRV-Cross compilation failed: {}", e.what());
+      last_compile_error_ = fmt::format("SPIRV-Cross compilation failed: {}",
+                                        e.what());
+      dump_spirv_for_failure("spirvcross_fail");
+      XELOGE(
+          "MslShader: {} shader={:016X} stage={} mod={:016X} spirv={}B "
+          "spirv_dump={}",
+          last_compile_error_, shader().ucode_data_hash(),
+          GetExecutionModelName(execution_model), modification(),
+          spirv_size_bytes,
+          last_diagnostic_spirv_path_.empty()
+              ? "<none>"
+              : last_diagnostic_spirv_path_.string());
       return false;
     }
     if (cvars::metal_shader_disk_cache) {
@@ -1156,7 +1273,11 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
   }
   spirv_cross_ms = to_ms(std::chrono::steady_clock::now() - spirv_cross_begin);
   if (msl_source_.empty()) {
-    XELOGE("MslShader: SPIRV-Cross compilation produced empty output");
+    last_compile_error_ = "SPIRV-Cross compilation produced empty output";
+    dump_spirv_for_failure("empty_msl");
+    XELOGE("MslShader: {} shader={:016X} stage={} mod={:016X}",
+           last_compile_error_, shader().ucode_data_hash(),
+           GetExecutionModelName(execution_model), modification());
     return false;
   }
   if (cvars::metal_spirvcross_strip_nocontract_optnone) {
@@ -1283,19 +1404,53 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
   if (error && error->localizedDescription() &&
       error->localizedDescription()->utf8String()) {
     // Metal may return warnings alongside a non-null library.
-    XELOGW("MslShader: Metal compile diagnostics: {}",
-           error->localizedDescription()->utf8String());
+    XELOGW(
+        "MslShader: Metal compile diagnostics shader={:016X} stage={} "
+        "mod={:016X}: {}",
+        shader().ucode_data_hash(), GetExecutionModelName(execution_model),
+        modification(), DescribeMetalError(error));
   }
 
   if (!metal_library_) {
-    if (error) {
-      XELOGE("MslShader: Metal library compilation failed: {}",
-             error->localizedDescription()->utf8String());
+    std::string first_error = DescribeMetalError(error);
+    NS::Error* retry_error = nullptr;
+    auto* retry_options = MTL::CompileOptions::alloc()->init();
+    retry_options->setFastMathEnabled(false);
+    retry_options->setLanguageVersion(language_version);
+    const auto retry_begin = std::chrono::steady_clock::now();
+    metal_library_ = device->newLibrary(source_str, retry_options,
+                                        &retry_error);
+    metal_library_ms +=
+        to_ms(std::chrono::steady_clock::now() - retry_begin);
+    retry_options->release();
+    if (metal_library_) {
+      XELOGW(
+          "MslShader: Metal library fallback succeeded with fast math disabled "
+          "shader={:016X} stage={} mod={:016X}; initial_error={}",
+          shader().ucode_data_hash(), GetExecutionModelName(execution_model),
+          modification(), first_error);
     } else {
-      XELOGE("MslShader: Metal library compilation failed (unknown error)");
+      last_compile_error_ = fmt::format(
+          "Metal library compilation failed; fast_math_error=[{}]; "
+          "strict_math_retry_error=[{}]",
+          first_error, DescribeMetalError(retry_error));
+      dump_msl_for_failure("metal_library_fail");
+      dump_spirv_for_failure("metal_library_fail");
+      XELOGE(
+          "MslShader: {} shader={:016X} stage={} mod={:016X} spirv={}B "
+          "msl={}B msl_dump={} spirv_dump={}",
+          last_compile_error_, shader().ucode_data_hash(),
+          GetExecutionModelName(execution_model), modification(),
+          spirv_size_bytes, msl_source_.size(),
+          last_diagnostic_msl_path_.empty()
+              ? "<none>"
+              : last_diagnostic_msl_path_.string(),
+          last_diagnostic_spirv_path_.empty()
+              ? "<none>"
+              : last_diagnostic_spirv_path_.string());
+      pool->release();
+      return false;
     }
-    pool->release();
-    return false;
   }
 
   // Get the entry point function.
@@ -1361,17 +1516,39 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
     }
   }
   if (!metal_function_) {
-    DumpMslResolveFailureSource(msl_source_, shader().ucode_data_hash(),
-                                modification(), shader().type());
+    last_compile_error_ = fmt::format(
+        "Metal library compiled but no usable {} function was found "
+        "(spirv_entry='{}', candidates=[{}], attempted=[{}], available=[{}], "
+        "spirv_entries=[{}])",
+        GetExecutionModelName(execution_model), spirv_entry_point_name,
+        JoinStringList(entry_point_candidates),
+        JoinStringList(attempted_function_names),
+        JoinStringList(available_function_names),
+        JoinStringList(spirv_entry_point_descriptions));
+    last_diagnostic_msl_path_ = DumpMslDiagnosticSource(
+        msl_source_, shader().ucode_data_hash(), modification(), shader().type(),
+        "entry_resolve_fail");
+    dump_spirv_for_failure("entry_resolve_fail");
+    if (!last_diagnostic_msl_path_.empty()) {
+      XELOGW("MslShader: Dumped unresolved-entry MSL source to {}",
+             last_diagnostic_msl_path_.string());
+    }
     XELOGE(
         "MslShader: Could not resolve function in compiled library "
         "(shader={:016X}, stage={}, spirv_entry='{}', candidates=[{}], "
-        "attempted=[{}], available=[{}], spirv_entries=[{}])",
+        "attempted=[{}], available=[{}], spirv_entries=[{}], msl_dump={}, "
+        "spirv_dump={})",
         shader().ucode_data_hash(), GetExecutionModelName(execution_model),
         spirv_entry_point_name, JoinStringList(entry_point_candidates),
         JoinStringList(attempted_function_names),
         JoinStringList(available_function_names),
-        JoinStringList(spirv_entry_point_descriptions));
+        JoinStringList(spirv_entry_point_descriptions),
+        last_diagnostic_msl_path_.empty()
+            ? "<none>"
+            : last_diagnostic_msl_path_.string(),
+        last_diagnostic_spirv_path_.empty()
+            ? "<none>"
+            : last_diagnostic_spirv_path_.string());
     metal_library_->release();
     metal_library_ = nullptr;
     pool->release();
@@ -1389,8 +1566,21 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
       argument_encoder_encoded_length_ =
           static_cast<uint32_t>(argument_encoder_->encodedLength());
     } else {
-      XELOGE("MslShader: Failed to create argument encoder for shader {:016X}",
-             shader().ucode_data_hash());
+      last_compile_error_ =
+          "failed to create Metal argument encoder for texture/sampler buffer";
+      dump_msl_for_failure("argument_encoder_fail");
+      dump_spirv_for_failure("argument_encoder_fail");
+      XELOGE(
+          "MslShader: Failed to create argument encoder for shader {:016X} "
+          "stage={} mod={:016X} msl_dump={} spirv_dump={}",
+          shader().ucode_data_hash(), GetExecutionModelName(execution_model),
+          modification(),
+          last_diagnostic_msl_path_.empty()
+              ? "<none>"
+              : last_diagnostic_msl_path_.string(),
+          last_diagnostic_spirv_path_.empty()
+              ? "<none>"
+              : last_diagnostic_spirv_path_.string());
       metal_function_->release();
       metal_function_ = nullptr;
       metal_library_->release();

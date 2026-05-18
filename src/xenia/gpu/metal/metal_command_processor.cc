@@ -520,6 +520,25 @@ MTL::BlendFactor ToMetalBlendFactorAlpha(xenos::BlendFactor blend_factor) {
 
 }  // namespace
 
+std::string MetalCommandProcessor::DescribeMslPipelineRequest(
+    const MslPipelineCompileRequest& request) {
+  return fmt::format(
+      "key=0x{:016X} vs=0x{:016X}/0x{:016X} ps=0x{:016X}/0x{:016X} "
+      "samples={} rt=[{},{},{},{}] depth={} stencil={} color_mask=0x{:08X} "
+      "alpha_to_mask={} blend=[0x{:08X},0x{:08X},0x{:08X},0x{:08X}] "
+      "vertex_fn={} fragment_fn={}",
+      request.pipeline_key, request.vertex_shader_hash,
+      request.vertex_modification, request.pixel_shader_hash,
+      request.pixel_modification, request.sample_count,
+      uint32_t(request.color_formats[0]), uint32_t(request.color_formats[1]),
+      uint32_t(request.color_formats[2]), uint32_t(request.color_formats[3]),
+      uint32_t(request.depth_format), uint32_t(request.stencil_format),
+      request.normalized_color_mask, request.alpha_to_mask_enable,
+      request.blendcontrol[0], request.blendcontrol[1],
+      request.blendcontrol[2], request.blendcontrol[3],
+      request.vertex_function ? 1 : 0, request.fragment_function ? 1 : 0);
+}
+
 MetalCommandProcessor::MetalCommandProcessor(
     MetalGraphicsSystem* graphics_system, kernel::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state) {}
@@ -924,8 +943,16 @@ MTL::RenderPipelineState* MetalCommandProcessor::CreateMslPipelineState(
   if (!pipeline && error_out && error) {
     NS::String* description = error->localizedDescription();
     if (description) {
-      *error_out = description->utf8String();
+      *error_out = fmt::format("{}; descriptor={}",
+                               description->utf8String(),
+                               DescribeMslPipelineRequest(request));
     }
+    LogMetalErrorDetails("SPIRV-Cross: Metal render pipeline compile error",
+                         error);
+  } else if (!pipeline && error_out) {
+    *error_out =
+        fmt::format("unknown Metal pipeline error; descriptor={}",
+                    DescribeMslPipelineRequest(request));
   }
 
   return pipeline;
@@ -1033,11 +1060,29 @@ void MetalCommandProcessor::MslShaderCompileThread(size_t thread_index) {
       if (!compiled &&
           ShouldLogRateLimited(msl_shader_compile_failure_last_log_ns_,
                                kMslAsyncLogIntervalNs)) {
+        const char* compile_error = "<none>";
+        std::string msl_dump = "<none>";
+        std::string spirv_dump = "<none>";
+        if (shader_request.translation) {
+          if (!shader_request.translation->last_compile_error().empty()) {
+            compile_error =
+                shader_request.translation->last_compile_error().c_str();
+          }
+          if (!shader_request.translation->last_diagnostic_msl_path().empty()) {
+            msl_dump =
+                shader_request.translation->last_diagnostic_msl_path().string();
+          }
+          if (!shader_request.translation->last_diagnostic_spirv_path()
+                   .empty()) {
+            spirv_dump = shader_request.translation->last_diagnostic_spirv_path()
+                             .string();
+          }
+        }
         XELOGE(
             "SPIRV-Cross: async Metal compile failed on worker {} (shader "
-            "{:016X}, mod {:016X})",
+            "{:016X}, mod {:016X}) error='{}' msl_dump={} spirv_dump={}",
             thread_index, shader_request.shader_hash,
-            shader_request.modification);
+            shader_request.modification, compile_error, msl_dump, spirv_dump);
       }
     }
     pool->release();
@@ -4220,6 +4265,95 @@ bool MetalCommandProcessor::IssueDrawMsl(
         stage_tag, translation->shader().ucode_data_hash(),
         translation->modification());
   };
+  uint32_t used_texture_mask_vertex =
+      msl_vertex_shader->GetUsedTextureMaskAfterTranslation();
+  uint32_t used_texture_mask_pixel = 0;
+  if (msl_pixel_shader) {
+    used_texture_mask_pixel =
+        msl_pixel_shader->GetUsedTextureMaskAfterTranslation();
+  }
+  uint32_t used_texture_mask =
+      used_texture_mask_vertex | used_texture_mask_pixel;
+  auto describe_render_formats = [&]() -> std::string {
+    uint32_t sample_count = 1;
+    MTL::PixelFormat color_formats[4] = {
+        MTL::PixelFormatInvalid, MTL::PixelFormatInvalid,
+        MTL::PixelFormatInvalid, MTL::PixelFormatInvalid};
+    MTL::PixelFormat depth_format = MTL::PixelFormatInvalid;
+    MTL::PixelFormat stencil_format = MTL::PixelFormatInvalid;
+    MTL::RenderPassDescriptor* pass_descriptor = current_render_pass_descriptor_;
+    if (!pass_descriptor) {
+      pass_descriptor = render_pass_descriptor_;
+    }
+    if (pass_descriptor) {
+      PopulatePipelineFormatsFromRenderPassDescriptor(
+          pass_descriptor, color_formats, 4, &depth_format, &stencil_format,
+          &sample_count);
+    }
+    return fmt::format("samples={} rt=[{},{},{},{}] depth={} stencil={}",
+                       sample_count, uint32_t(color_formats[0]),
+                       uint32_t(color_formats[1]), uint32_t(color_formats[2]),
+                       uint32_t(color_formats[3]), uint32_t(depth_format),
+                       uint32_t(stencil_format));
+  };
+  auto describe_texture_fetches = [&](uint32_t texture_mask) -> std::string {
+    std::string description;
+    uint32_t remaining_fetch_bits = texture_mask;
+    uint32_t fetch_index = 0;
+    while (xe::bit_scan_forward(remaining_fetch_bits, &fetch_index)) {
+      remaining_fetch_bits &= ~(uint32_t(1) << fetch_index);
+      xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_index);
+      uint32_t width_minus_1 = 0;
+      uint32_t height_minus_1 = 0;
+      uint32_t depth_or_array_size_minus_1 = 0;
+      texture_util::GetSubresourcesFromFetchConstant(
+          fetch, &width_minus_1, &height_minus_1,
+          &depth_or_array_size_minus_1, nullptr, nullptr, nullptr, nullptr);
+      if (!description.empty()) {
+        description += "; ";
+      }
+      description += fmt::format(
+          "{}:{}({}) {}x{}x{} dim={} tiled={} endian={} pitch={} vs={} ps={}",
+          fetch_index, uint32_t(fetch.format),
+          FormatInfo::GetName(fetch.format), width_minus_1 + 1,
+          height_minus_1 + 1, depth_or_array_size_minus_1 + 1,
+          uint32_t(fetch.dimension),
+          fetch.tiled ? 1 : 0, uint32_t(fetch.endianness), fetch.pitch,
+          (used_texture_mask_vertex & (uint32_t(1) << fetch_index)) ? 1 : 0,
+          (used_texture_mask_pixel & (uint32_t(1) << fetch_index)) ? 1 : 0);
+    }
+    return description.empty() ? "<none>" : description;
+  };
+  auto log_shader_compile_failure = [&](MslShader::MslTranslation* translation,
+                                        const char* stage_tag) {
+    std::string msl_dump = "<none>";
+    std::string spirv_dump = "<none>";
+    if (translation && !translation->last_diagnostic_msl_path().empty()) {
+      msl_dump = translation->last_diagnostic_msl_path().string();
+    }
+    if (translation && !translation->last_diagnostic_spirv_path().empty()) {
+      spirv_dump = translation->last_diagnostic_spirv_path().string();
+    }
+    XELOGE(
+        "SPIRV-Cross: Failed to prepare {} shader MSL/library/function "
+        "shader={:016X} mod={:016X} error='{}' vs={:016X}/0x{:016X} "
+        "ps={:016X}/0x{:016X} host_vertices={} color_mask=0x{:08X} "
+        "memexport={} tessellated={} render_targets='{}' textures='{}' "
+        "msl_dump={} spirv_dump={}",
+        stage_tag, translation ? translation->shader().ucode_data_hash() : 0,
+        translation ? translation->modification() : 0,
+        translation && !translation->last_compile_error().empty()
+            ? translation->last_compile_error()
+            : "<none>",
+        vertex_translation->shader().ucode_data_hash(),
+        vertex_translation->modification(),
+        pixel_translation ? pixel_translation->shader().ucode_data_hash() : 0,
+        pixel_translation ? pixel_translation->modification() : 0,
+        primitive_processing_result.host_draw_vertex_count,
+        normalized_color_mask, memexport_used ? 1 : 0, is_tessellated ? 1 : 0,
+        describe_render_formats(), describe_texture_fetches(used_texture_mask),
+        msl_dump, spirv_dump);
+  };
   MslShaderCompileStatus vertex_compile_status =
       ensure_msl_translation_ready(vertex_translation, 1);
   if (vertex_compile_status == MslShaderCompileStatus::kPending) {
@@ -4227,7 +4361,7 @@ bool MetalCommandProcessor::IssueDrawMsl(
     return true;
   }
   if (vertex_compile_status == MslShaderCompileStatus::kFailed) {
-    XELOGE("SPIRV-Cross: Failed to prepare vertex shader MSL/library/function");
+    log_shader_compile_failure(vertex_translation, "vertex");
     return false;
   }
 
@@ -4250,8 +4384,7 @@ bool MetalCommandProcessor::IssueDrawMsl(
       return true;
     }
     if (pixel_compile_status == MslShaderCompileStatus::kFailed) {
-      XELOGE(
-          "SPIRV-Cross: Failed to prepare pixel shader MSL/library/function");
+      log_shader_compile_failure(pixel_translation, "pixel");
       return false;
     }
   }
@@ -4286,17 +4419,6 @@ bool MetalCommandProcessor::IssueDrawMsl(
     XELOGE("SPIRV-Cross: Failed to create pipeline state");
     return false;
   }
-
-  // Request textures used by the shaders.
-  uint32_t used_texture_mask_vertex =
-      msl_vertex_shader->GetUsedTextureMaskAfterTranslation();
-  uint32_t used_texture_mask_pixel = 0;
-  if (msl_pixel_shader) {
-    used_texture_mask_pixel =
-        msl_pixel_shader->GetUsedTextureMaskAfterTranslation();
-  }
-  uint32_t used_texture_mask =
-      used_texture_mask_vertex | used_texture_mask_pixel;
 
   if (::cvars::metal_viva_pinata_diagnostics) {
     static std::unordered_set<uint64_t> logged_draws;

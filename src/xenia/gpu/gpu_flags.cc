@@ -136,6 +136,14 @@ DEFINE_bool(metal_viva_pinata_diagnostics, false,
             "Log targeted Metal texture, shader, and resolve diagnostics for "
             "Viva Pinata rendering corruption investigation.",
             "GPU");
+DEFINE_bool(
+    metal_spirvcross_sampler_overflow_fallback, false,
+    "When the Metal SPIRV-Cross path would emit more than 16 samplers for a "
+    "shader, alias overflow sampler bindings with a previously emitted sampler "
+    "that has matching filter state so the shader can still be compiled. This "
+    "is a targeted compatibility fallback for games that exceed Metal's "
+    "per-stage sampler limit.",
+    "GPU");
 
 // On iOS, Metal Shader Converter is unavailable, so use SPIRV-Cross.
 // On macOS, prefer the MSC path by default.

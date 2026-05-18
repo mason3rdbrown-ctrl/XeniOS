@@ -16,6 +16,7 @@
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/math.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/spirv_compatibility.h"
 
@@ -2514,6 +2515,40 @@ size_t SpirvShaderTranslator::FindOrAddSamplerBinding(
         sampler_binding.mip_filter == mip_filter &&
         sampler_binding.aniso_filter == aniso_filter) {
       return i;
+    }
+  }
+  if (cvars::metal_spirvcross_sampler_overflow_fallback &&
+      sampler_bindings_.size() >= 16) {
+    for (size_t i = 0; i < sampler_bindings_.size(); ++i) {
+      const SamplerBinding& sampler_binding = sampler_bindings_[i];
+      if (sampler_binding.mag_filter == mag_filter &&
+          sampler_binding.min_filter == min_filter &&
+          sampler_binding.mip_filter == mip_filter &&
+          sampler_binding.aniso_filter == aniso_filter) {
+        XELOGW(
+            "SPIR-V sampler overflow fallback: shader={:016X} aliasing "
+            "fetch {} to sampler {} from fetch {} (filters={}{}{} aniso={})",
+            current_shader().ucode_data_hash(), fetch_constant, i,
+            sampler_binding.fetch_constant, uint32_t(mag_filter),
+            uint32_t(min_filter), uint32_t(mip_filter),
+            uint32_t(aniso_filter));
+        return i;
+      }
+    }
+    if (!sampler_bindings_.empty()) {
+      const SamplerBinding& fallback_binding = sampler_bindings_.back();
+      XELOGW(
+          "SPIR-V sampler overflow fallback: shader={:016X} aliasing fetch {} "
+          "to last sampler {} from fetch {} without matching filter state "
+          "(requested={}{}{} aniso={}, fallback={}{}{} aniso={})",
+          current_shader().ucode_data_hash(), fetch_constant,
+          sampler_bindings_.size() - 1, fallback_binding.fetch_constant,
+          uint32_t(mag_filter), uint32_t(min_filter), uint32_t(mip_filter),
+          uint32_t(aniso_filter), uint32_t(fallback_binding.mag_filter),
+          uint32_t(fallback_binding.min_filter),
+          uint32_t(fallback_binding.mip_filter),
+          uint32_t(fallback_binding.aniso_filter));
+      return sampler_bindings_.size() - 1;
     }
   }
   // TODO(Triang3l): Limit the total count to that actually supported by the

@@ -43,6 +43,7 @@ DECLARE_int32(metal_heap_min_bytes);
 DECLARE_bool(metal_texture_cache_use_private);
 DECLARE_bool(metal_texture_upload_via_blit);
 DECLARE_bool(metal_viva_pinata_diagnostics);
+DECLARE_bool(metal_spirvcross_sampler_overflow_fallback);
 DECLARE_bool(metal_use_spirvcross);
 
 DECLARE_bool(occlusion_query_enable);

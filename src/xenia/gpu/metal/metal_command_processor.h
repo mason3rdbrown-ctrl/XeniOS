@@ -410,6 +410,8 @@ class MetalCommandProcessor : public CommandProcessor {
   bool EnqueueMslPipelineCompilation(const MslPipelineCompileRequest& request);
   MTL::RenderPipelineState* CreateMslPipelineState(
       const MslPipelineCompileRequest& request, std::string* error_out);
+  static std::string DescribeMslPipelineRequest(
+      const MslPipelineCompileRequest& request);
   void MslShaderCompileThread(size_t thread_index);
   MTL::RenderPipelineState* GetOrCreateMslPipelineState(
       MslShader::MslTranslation* vertex_translation,

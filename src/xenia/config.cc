@@ -82,6 +82,10 @@ void ApplyBuiltInTitleConfig(uint32_t title_id) {
   if (SetBuiltInGameConfigValue("metal_viva_pinata_diagnostics", true)) {
     XELOGI("Applied built-in Viva Pinata Metal diagnostics config");
   }
+  if (SetBuiltInGameConfigValue("metal_spirvcross_sampler_overflow_fallback",
+                                true)) {
+    XELOGI("Applied built-in Viva Pinata Metal sampler overflow fallback");
+  }
 }
 
 bool sortCvar(cvar::IConfigVar* a, cvar::IConfigVar* b) {
