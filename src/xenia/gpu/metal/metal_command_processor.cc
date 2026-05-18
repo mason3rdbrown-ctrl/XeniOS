@@ -4229,6 +4229,7 @@ bool MetalCommandProcessor::IssueDrawMsl(
       return false;
     }
   }
+  MslShader::MslTranslation* pixel_translation = nullptr;
   auto ensure_msl_translation_ready =
       [&](MslShader::MslTranslation* translation,
           uint8_t priority) -> MslShaderCompileStatus {
@@ -4318,7 +4319,8 @@ bool MetalCommandProcessor::IssueDrawMsl(
           FormatInfo::GetName(fetch.format), width_minus_1 + 1,
           height_minus_1 + 1, depth_or_array_size_minus_1 + 1,
           uint32_t(fetch.dimension),
-          fetch.tiled ? 1 : 0, uint32_t(fetch.endianness), fetch.pitch,
+          fetch.tiled ? 1 : 0, uint32_t(fetch.endianness),
+          uint32_t(fetch.pitch),
           (used_texture_mask_vertex & (uint32_t(1) << fetch_index)) ? 1 : 0,
           (used_texture_mask_pixel & (uint32_t(1) << fetch_index)) ? 1 : 0);
     }
@@ -4365,7 +4367,6 @@ bool MetalCommandProcessor::IssueDrawMsl(
     return false;
   }
 
-  MslShader::MslTranslation* pixel_translation = nullptr;
   if (msl_pixel_shader) {
     pixel_translation = static_cast<MslShader::MslTranslation*>(
         msl_pixel_shader->GetOrCreateTranslation(
