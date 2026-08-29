@@ -93,8 +93,6 @@ DECLARE_bool(metal_backend_telemetry);
 DECLARE_int32(metal_backend_telemetry_interval);
 DECLARE_bool(metal_root_rebuild_detail_telemetry);
 
-DECLARE_bool(ac6_ground_fix);
-
 DECLARE_bool(force_depth_clamp);
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
