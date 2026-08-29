@@ -1,0 +1,129 @@
+name: Codex iOS Canary Audio Port IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Marketing version"
+        required: false
+        default: "1.0.1"
+        type: string
+      build_number:
+        description: "Build number"
+        required: false
+        default: "9288.2"
+        type: string
+      ios_min:
+        description: "Minimum iOS version"
+        required: false
+        default: "18.0"
+        type: string
+  push:
+    branches:
+      - "codex/ios-canary-audio-port-20260829"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "codex-ios-canary-audio-port-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build-ios-ipa:
+    name: Build iOS IPA
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_26.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app
+          elif [ -d /Applications/Xcode.app ]; then
+            sudo xcode-select -s /Applications/Xcode.app
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          chmod +x xb xenia-build.py tools/build_apple_release.sh tools/package_ios_ipa.sh
+
+      - name: Fetch submodules and data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local attempts=0
+            until "$@"; do
+              attempts=$((attempts + 1))
+              if [ "$attempts" -ge 5 ]; then
+                return 1
+              fi
+              sleep 10
+            done
+          }
+
+          retry git submodule sync --recursive
+          retry git submodule update --init --depth=1 --recursive -j"$(sysctl -n hw.ncpu)"
+          retry git -C third_party/DirectXShaderCompiler submodule update --init --depth=1 \
+            external/SPIRV-Headers external/SPIRV-Tools
+
+          python3 xenia-build.py fetchdata
+
+      - name: Build ad-hoc signed IPA
+        shell: bash
+        env:
+          VERSION_INPUT: "${{ github.event.inputs.version }}"
+          BUILD_NUMBER_INPUT: "${{ github.event.inputs.build_number }}"
+          IOS_MIN_INPUT: "${{ github.event.inputs.ios_min }}"
+        run: |
+          set -euo pipefail
+
+          version="${VERSION_INPUT:-1.0.1}"
+          build_number="${BUILD_NUMBER_INPUT:-9288.2}"
+          ios_min="${IOS_MIN_INPUT:-18.0}"
+
+          mkdir -p scratch/artifacts
+          tools/build_apple_release.sh \
+            --skip-macos-arm64 \
+            --skip-macos-x86_64 \
+            --skip-macos-universal \
+            --channel preview \
+            --stage alpha \
+            --config release \
+            --version "${version}" \
+            --build-number "${build_number}" \
+            --ios-min "${ios_min}" \
+            --random-ios-bundle-id 2>&1 | tee scratch/artifacts/codex_ios_canary_audio_port_build.log
+
+          test -f scratch/artifacts/xenios_ios_iphone_ipad.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenios-ios-canary-audio-port-ipa
+          path: scratch/artifacts/xenios_ios_iphone_ipad.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenios-ios-canary-audio-port-build-log
+          path: scratch/artifacts/codex_ios_canary_audio_port_build.log
+          if-no-files-found: ignore
+          retention-days: 14
