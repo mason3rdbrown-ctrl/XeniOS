@@ -2640,8 +2640,8 @@ bool VulkanRenderTargetCache::PreflightPendingDrawPassTransfers(
     bool need_stencil_bit_draws =
         dest_key.is_depth &&
         !vulkan_device->extensions().ext_EXT_shader_stencil_export;
-    for (uint32_t stencil_pass = 0; stencil_pass <= need_stencil_bit_draws;
-         ++stencil_pass) {
+    for (uint32_t stencil_pass = 0;
+         stencil_pass <= uint32_t(need_stencil_bit_draws); ++stencil_pass) {
       for (const Transfer& transfer : pending_draw_pass_transfers_[i]) {
         auto* source_vulkan_rt =
             static_cast<VulkanRenderTarget*>(transfer.source);

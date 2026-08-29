@@ -72,7 +72,7 @@ class AudioMediaPlayer {
   void SetXMPOverride(bool xmp_override) { xmp_override_ = xmp_override; }
   bool IsXMPOverrideEnabled() const { return xmp_override_; }
 
-  uint32_t GetDashInItState() const { return dash_init_state; }
+  uint32_t GetDashInitState() const { return dash_init_state; }
 
   void SetXMPClient(XmpClient xmp_client) { xmp_client_ = xmp_client; }
 
@@ -87,6 +87,10 @@ class AudioMediaPlayer {
   XmpClient GetXMPClient() const { return xmp_client_; }
 
   bool IsTitleInPlaybackControl() const {
+    if (IsXMPOverrideEnabled()) {
+      return false;
+    }
+
     const bool game_control = xmp_client_ == XmpClient::kGame &&
                               playback_controller_ == PlaybackController::kGame;
 

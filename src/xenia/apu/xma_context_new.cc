@@ -186,7 +186,11 @@ bool XmaContextNew::Work() {
     Decode(&data);
     Consume(&output_rb, &data);
 
-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+    // Don't abandon a partially consumed frame. Consume() hands over at most
+    // subframe_decode_count blocks per pass, so the pass that exhausts the
+    // input can leave the rest of the frame undelivered.
+    if ((!data.IsAnyInputBufferValid() || data.error_status == 4) &&
+        current_frame_remaining_subframes_ == 0) {
       XELOGAPU(
           "XmaContext {}: Work loop exit - buffers_valid={} error_status={}",
           id(), data.IsAnyInputBufferValid(), data.error_status);
@@ -772,7 +776,14 @@ const uint32_t XmaContextNew::GetNextPacketReadOffset(
                next_packet_index, current_input_packet_count);
       return new_input_buffer_offset;
     }
-    next_packet_index++;
+    // No frame starts in this packet, so it is entirely the continuation of a
+    // frame split across a packet boundary. Follow this packet's skip count to
+    // keep walking the same sub-stream instead of merging into another one.
+    const uint8_t next_skip = xma::GetPacketSkipCount(next_packet);
+    if (next_skip == 0xFF) {
+      break;
+    }
+    next_packet_index += next_skip + 1;
   }
 
   return kBitsPerPacketHeader;
