@@ -20,10 +20,21 @@
 #include "xenia/base/platform.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
-#if XE_PLATFORM_LINUX
+#if XE_PLATFORM_LINUX || XE_PLATFORM_APPLE
 #include <dlfcn.h>
 #elif XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
+#endif
+
+#if XE_PLATFORM_APPLE
+// MoltenVK is statically linked; vulkan_api.h sets VK_NO_PROTOTYPES, so make
+// the loader entry points visible to the manual function table.
+extern "C" {
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vkGetInstanceProcAddr(VkInstance instance, const char* pName);
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator);
+}
 #endif
 
 DEFINE_bool(
@@ -65,6 +76,8 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
   functions_loaded &=                                                    \
       (ifn.name = PFN_##name(dlsym(vulkan_instance->loader_, #name))) != \
       nullptr;
+#elif XE_PLATFORM_APPLE
+#define XE_VULKAN_LOAD_LOADER_FUNCTION(name) ifn.name = &::name;
 #elif XE_PLATFORM_WIN32
   vulkan_instance->loader_ = LoadLibraryW(L"vulkan-1.dll");
   if (!vulkan_instance->loader_) {
