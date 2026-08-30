@@ -439,6 +439,14 @@ XeResolveInfo XeResolveGetInfo(param_push_consts_xe) {
     }
   }
 
+  void XeResolveUnpack32bpp8RedSamples(
+      uint4_xe packed_0123, uint4_xe packed_4567, uint format, bool swap,
+      out_param_xe(float4_xe, samples_0123),
+      out_param_xe(float4_xe, samples_4567)) {
+    XeResolveUnpack32bpp8ScalarSamples(packed_0123, packed_4567, format, swap,
+                                       false, samples_0123, samples_4567);
+  }
+
   void XeResolveUnpack64bpp2Samples(
       uint4_xe packed, uint format, out_param_xe(float4_xe, sample_0),
       out_param_xe(float4_xe, sample_1)) {
@@ -537,6 +545,14 @@ XeResolveInfo XeResolveGetInfo(param_push_consts_xe) {
         }
         break;
     }
+  }
+
+  void XeResolveUnpack64bpp8RedUnswappedSamples(
+      uint4_xe packed_0123, uint4_xe packed_4567, uint format,
+      out_param_xe(float4_xe, samples_0123),
+      out_param_xe(float4_xe, samples_4567)) {
+    XeResolveUnpack64bpp8ScalarSamples(packed_0123, packed_4567, format, false,
+                                       samples_0123, samples_4567);
   }
 
   #if XE_RESOLVE_COPY_EDRAM_BYTE_BUFFER_ALIGNMENT == 4
