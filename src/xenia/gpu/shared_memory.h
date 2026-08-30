@@ -71,11 +71,29 @@ class SharedMemory {
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the host GPU memory backing the range are resident. Returns true if
   // the range has been fully updated and is usable.
+  struct Range {
+    uint32_t start;
+    uint32_t length;
+  };
+  struct RequestRangeStats {
+    uint32_t input_ranges = 0;
+    uint32_t invalid_input_ranges = 0;
+    uint32_t upload_page_ranges_before_coalesce = 0;
+    uint32_t upload_page_ranges_after_coalesce = 0;
+    uint64_t upload_bytes = 0;
+  };
   bool RequestRange(uint32_t start, uint32_t length);
+  bool RequestRanges(const Range* ranges, uint32_t range_count,
+                     RequestRangeStats* stats = nullptr);
   // Returns whether every page in the range is currently valid in the host GPU
   // memory copy. Hold the global critical region if relying on this for state
   // transitions such as watch installation.
   bool IsRangeValid(uint32_t start, uint32_t length) const;
+  // Returns whether no page in the range is currently valid in the host GPU
+  // shared-memory copy.
+  bool IsRangeInvalid(uint32_t start, uint32_t length) const;
+  // Enables CPU write invalidation callbacks without changing residency.
+  void WatchRangeForCpuWrites(uint32_t start, uint32_t length);
 
   void TryFindUploadRange(const uint32_t& block_first,
                           const uint32_t& block_last,

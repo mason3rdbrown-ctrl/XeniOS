@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/shared_memory.h"
 
+#include <algorithm>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/bit_range.h"
 #include "xenia/base/logging.h"
@@ -372,50 +374,159 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   range->next_free = watch_range_first_free_;
   watch_range_first_free_ = range;
 }
-// todo: optimize, an enormous amount of cpu time (1.34%) is spent here.
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
-  if (!length) {
-    // Some texture or buffer is empty, for example - safe to draw in this case.
+  Range range = {start, length};
+  return RequestRanges(&range, 1);
+}
+
+bool SharedMemory::RequestRanges(const Range* ranges, uint32_t range_count,
+                                 RequestRangeStats* stats) {
+  RequestRangeStats local_stats;
+  RequestRangeStats& request_stats = stats ? *stats : local_stats;
+  request_stats = {};
+  request_stats.input_ranges = range_count;
+  if (!range_count) {
     return true;
-  }
-  if (start > kBufferSize || (kBufferSize - start) < length) {
-    return false;
   }
 
   SCOPE_profile_cpu_f("gpu");
 
-  if (!EnsureHostGpuMemoryAllocated(start, length)) {
-    return false;
+  for (uint32_t i = 0; i < range_count; ++i) {
+    const Range& range = ranges[i];
+    if (!range.length) {
+      continue;
+    }
+    if (range.start > kBufferSize ||
+        (kBufferSize - range.start) < range.length) {
+      return false;
+    }
+    if (!EnsureHostGpuMemoryAllocated(range.start, range.length)) {
+      return false;
+    }
   }
-
-  unsigned int current_upload_range = 0;
-  uint32_t page_first = start >> page_size_log2_;
-  uint32_t page_last = (start + length - 1) >> page_size_log2_;
 
   upload_ranges_.clear();
 
   std::pair<uint32_t, uint32_t>* uploads =
       reinterpret_cast<std::pair<uint32_t, uint32_t>*>(upload_ranges_.data());
 
-  uint32_t block_first = page_first >> 6;
-  // swcache::PrefetchL1(&system_page_flags_[block_first]);
-  uint32_t block_last = page_last >> 6;
-  uint32_t range_start = UINT32_MAX;
+  unsigned int current_upload_range = 0;
 
   {
     auto global_lock = global_critical_region_.Acquire();
-    TryFindUploadRange(block_first, block_last, page_first, page_last,
-                       range_start, current_upload_range, uploads);
+    for (uint32_t i = 0; i < range_count; ++i) {
+      const Range& range = ranges[i];
+      if (!range.length) {
+        continue;
+      }
+
+      uint32_t page_first = range.start >> page_size_log2_;
+      uint32_t page_last =
+          (range.start + range.length - 1) >> page_size_log2_;
+      uint32_t block_first = page_first >> 6;
+      uint32_t block_last = page_last >> 6;
+
+      if (IsRangeValid(range.start, range.length)) {
+        continue;
+      }
+      ++request_stats.invalid_input_ranges;
+
+      uint32_t range_start = UINT32_MAX;
+      TryFindUploadRange(block_first, block_last, page_first, page_last,
+                         range_start, current_upload_range, uploads);
+      if (range_start != UINT32_MAX) {
+        if (current_upload_range >= MAX_UPLOAD_RANGES) {
+          xe::FatalError(
+              "Hit max upload ranges in shared_memory.cc, tell a dev to "
+              "raise the limit!");
+        }
+        uploads[current_upload_range++] =
+            std::make_pair(range_start, page_last + 1 - range_start);
+      }
+    }
   }
-  if (range_start != UINT32_MAX) {
-    uploads[current_upload_range++] =
-        (std::make_pair(range_start, page_last + 1 - range_start));
-  }
+
   if (!current_upload_range) {
     return true;
   }
 
-  return UploadRanges(uploads, current_upload_range);
+  request_stats.upload_page_ranges_before_coalesce = current_upload_range;
+
+  std::sort(
+      uploads, uploads + current_upload_range,
+      [](const std::pair<uint32_t, uint32_t>& a,
+         const std::pair<uint32_t, uint32_t>& b) { return a.first < b.first; });
+
+  uint32_t coalesced_upload_range_count = 0;
+  for (uint32_t i = 0; i < current_upload_range; ++i) {
+    const auto& upload_range = uploads[i];
+    if (!upload_range.second) {
+      continue;
+    }
+    uint32_t start = upload_range.first;
+    uint32_t end = upload_range.first + upload_range.second;
+    if (!coalesced_upload_range_count) {
+      uploads[coalesced_upload_range_count++] =
+          std::make_pair(start, end - start);
+      continue;
+    }
+
+    auto& previous = uploads[coalesced_upload_range_count - 1];
+    uint32_t previous_end = previous.first + previous.second;
+    if (start <= previous_end) {
+      if (end > previous_end) {
+        previous.second = end - previous.first;
+      }
+    } else {
+      uploads[coalesced_upload_range_count++] =
+          std::make_pair(start, end - start);
+    }
+  }
+
+  request_stats.upload_page_ranges_after_coalesce =
+      coalesced_upload_range_count;
+  for (uint32_t i = 0; i < coalesced_upload_range_count; ++i) {
+    request_stats.upload_bytes += uint64_t(uploads[i].second)
+                                  << page_size_log2_;
+  }
+
+  return UploadRanges(uploads, coalesced_upload_range_count);
+}
+
+bool SharedMemory::IsRangeInvalid(uint32_t start, uint32_t length) const {
+  if (!length) {
+    return true;
+  }
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  uint32_t block_first = page_first >> 6;
+  uint32_t block_last = page_last >> 6;
+
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t range_mask = UINT64_MAX;
+    if (i == block_first) {
+      range_mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      range_mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (system_page_flags_valid_[i] & range_mask) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void SharedMemory::WatchRangeForCpuWrites(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize || !memory_invalidation_callback_handle_) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  memory().EnablePhysicalMemoryAccessCallbacks(start, length, true, false);
 }
 
 bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) const {
