@@ -25,6 +25,12 @@ namespace ui {
 namespace vulkan {
 
 bool SpirvToolsContext::Initialize(unsigned int spirv_version) {
+#if XE_PLATFORM_APPLE
+  fn_spvContextCreate_ = &spvContextCreate;
+  fn_spvContextDestroy_ = &spvContextDestroy;
+  fn_spvValidateBinary_ = &spvValidateBinary;
+  fn_spvDiagnosticDestroy_ = &spvDiagnosticDestroy;
+#else
   const char* vulkan_sdk_env = std::getenv("VULKAN_SDK");
   if (!vulkan_sdk_env) {
     XELOGE("SPIRV-Tools: Failed to get the VULKAN_SDK environment variable");
@@ -61,6 +67,7 @@ bool SpirvToolsContext::Initialize(unsigned int spirv_version) {
     Shutdown();
     return false;
   }
+#endif
   spv_target_env target_env;
   if (spirv_version >= 0x10500) {
     target_env = SPV_ENV_VULKAN_1_2;
@@ -85,14 +92,17 @@ void SpirvToolsContext::Shutdown() {
     fn_spvContextDestroy_(context_);
     context_ = nullptr;
   }
-  if (library_) {
 #if XE_PLATFORM_LINUX
+  if (library_) {
     dlclose(library_);
-#elif XE_PLATFORM_WIN32
-    FreeLibrary(library_);
-#endif
     library_ = nullptr;
   }
+#elif XE_PLATFORM_WIN32
+  if (library_) {
+    FreeLibrary(library_);
+    library_ = nullptr;
+  }
+#endif
 }
 
 spv_result_t SpirvToolsContext::Validate(const uint32_t* words,

@@ -52,6 +52,8 @@ class SpirvToolsContext {
 #elif XE_PLATFORM_WIN32
     function =
         reinterpret_cast<FunctionPointer>(GetProcAddress(library_, name));
+#elif XE_PLATFORM_APPLE
+    function = nullptr;
 #else
 #error No SPIRV-Tools LoadLibraryFunction provided for the target platform.
 #endif
