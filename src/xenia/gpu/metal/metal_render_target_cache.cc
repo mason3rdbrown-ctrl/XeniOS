@@ -4141,7 +4141,8 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
                 // updated shared memory. This matches D3D12/Vulkan behavior.
                 if (auto* tex_cache = command_processor_.texture_cache()) {
                   tex_cache->MarkRangeAsResolved(written_address,
-                                                 written_length);
+                                                 written_length,
+                                                 draw_resolution_scaled);
                 }
 
                 copy_succeeded = true;

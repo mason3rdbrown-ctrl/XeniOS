@@ -988,7 +988,8 @@ bool MetalRenderTargetCache::TryDirectHostResolveCopy(
   written_address = resolve_info.copy_dest_extent_start;
   written_length = resolve_info.copy_dest_extent_length;
   if (texture_cache) {
-    texture_cache->MarkRangeAsResolved(written_address, written_length);
+    texture_cache->MarkRangeAsResolved(written_address, written_length,
+                                       draw_resolution_scaled);
   }
 
   ++direct_telemetry.direct_host_success;
