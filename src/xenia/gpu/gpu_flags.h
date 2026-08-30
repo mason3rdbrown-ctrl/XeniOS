@@ -16,16 +16,24 @@ DECLARE_bool(trace_gpu_stream);
 
 DECLARE_path(dump_shaders);
 
-DECLARE_bool(guest_display_refresh_cap);
+DECLARE_bool(use_50Hz_mode);
 
-DECLARE_uint32(framerate_limit);
+DECLARE_bool(vsync);
+
+DECLARE_uint64(framerate_limit);
+
+DECLARE_bool(guest_display_refresh_cap);
 
 void SetGuestDisplayRefreshCap(bool value);
 void SetFramerateLimit(uint32_t value);
 
 DECLARE_bool(gpu_allow_invalid_fetch_constants);
 
+DECLARE_bool(gpu_allow_invalid_upload_range);
+
 DECLARE_bool(non_seamless_cube_map);
+
+DECLARE_bool(vulkan_precise_interpolation);
 
 DECLARE_bool(half_pixel_offset);
 
@@ -64,6 +72,8 @@ DECLARE_bool(no_discard_stencil_in_transfer_pipelines);
 
 DECLARE_bool(submit_on_primary_buffer_end);
 
+DECLARE_bool(force_convert_triangle_strips_to_lists);
+
 DECLARE_bool(async_shader_compilation);
 
 DECLARE_bool(readback_resolve_half_pixel_offset);
@@ -84,6 +94,8 @@ DECLARE_int32(metal_backend_telemetry_interval);
 DECLARE_bool(metal_root_rebuild_detail_telemetry);
 
 DECLARE_bool(ac6_ground_fix);
+
+DECLARE_bool(force_depth_clamp);
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
 

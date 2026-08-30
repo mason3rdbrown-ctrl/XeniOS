@@ -7,13 +7,14 @@ target_link_libraries(xenia-gpu-d3d12 PUBLIC
 xe_target_defaults(xenia-gpu-d3d12)
 
 if(XENIA_BUILD_MISC)
+  # D3D12 trace viewer
   add_executable(xenia-gpu-d3d12-trace-viewer WIN32
     ${CMAKE_CURRENT_SOURCE_DIR}/d3d12_trace_viewer_main.cc
-    ${PROJECT_SOURCE_DIR}/src/xenia/ui/windowed_app_main_qt.cc
+    ${PROJECT_SOURCE_DIR}/src/xenia/ui/windowed_app_main_win.cc
   )
   target_link_libraries(xenia-gpu-d3d12-trace-viewer PRIVATE
     xenia-apu xenia-apu-nop xenia-base xenia-core xenia-cpu
-    xenia-gpu xenia-gpu-d3d12 xenia-hid xenia-hid-nop xenia-hid-portal
+    xenia-gpu xenia-gpu-d3d12 xenia-hid xenia-hid-nop
     xenia-kernel xenia-patcher xenia-ui xenia-ui-d3d12 xenia-vfs
     aes_128 capstone dxbc fmt imgui libavcodec libavutil mspack snappy xxhash
   )
@@ -29,7 +30,7 @@ if(XENIA_BUILD_MISC)
   )
   target_link_libraries(xenia-gpu-d3d12-trace-dump PRIVATE
     xenia-apu xenia-apu-nop xenia-base xenia-core xenia-cpu
-    xenia-gpu xenia-gpu-d3d12 xenia-hid xenia-hid-nop xenia-hid-portal
+    xenia-gpu xenia-gpu-d3d12 xenia-hid xenia-hid-nop
     xenia-kernel xenia-patcher xenia-ui xenia-ui-d3d12 xenia-vfs
     aes_128 capstone dxbc fmt imgui libavcodec libavutil mspack snappy xxhash
   )

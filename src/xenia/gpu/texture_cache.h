@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <type_traits>
 #include <unordered_map>
 
 #include "xenia/base/assert.h"
@@ -47,10 +48,10 @@ namespace gpu {
 //   However, the max level is not ignored because any mip count can be
 //   specified when creating a texture, and another texture may be placed after
 //   the last one.
-// - If the texture has a mip address, but the base address is 0 or the same as
-//   the mip address, a mipmapped texture is created, but min/max LOD is clamped
-//   to the lower bound of 1 - the game is expected to do that anyway until the
-//   largest LOD is loaded.
+// - If the texture has a mip address, but the base address is 0, a mipmapped
+//   texture is created with the minimum LOD clamped to 1.
+// - If the base and mip addresses are the same with a nonzero minimum mip
+//   level, level 0 is already excluded, so the base upload is skipped.
 // TODO(Triang3l): Attach the largest LOD to existing textures with a valid
 // mip_address but no base ever used yet (no base_address) to save memory
 // because textures are streamed this way anyway.
@@ -97,7 +98,13 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // Marks the range as containing resolved data and invalidates textures
+  // overlapping it. resolution_scaled is whether the data went to the scaled
+  // resolve address space, or to shared memory, such as resolves done at
+  // native resolution when a scale threshold is set. The latter clears the
+  // scaled state of the range.
+  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                           bool resolution_scaled);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(
@@ -124,18 +131,6 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
-  // Returns whether RequestTextures(used_texture_mask) may need to process
-  // bindings or reload texture data from guest memory. Used as a cheap
-  // pre-check to skip the full RequestTextures call when nothing changed.
-  bool AnyUsedTextureRequestWorkPending(uint32_t used_texture_mask) const;
-  // Conservative non-mutating check for whether RequestTextures may call
-  // LoadTextureDataFromResidentMemoryImpl for any used texture.
-  bool MayRequestTexturesLoadData(uint32_t used_texture_mask) const;
-  uint32_t GetUsedTextureRequestWorkMask(uint32_t used_texture_mask) const;
-  uint32_t GetUsedTextureRangeOverlapMask(uint32_t used_texture_mask,
-                                          uint32_t start,
-                                          uint32_t length) const;
-  size_t GetTotalTextureCount() const { return textures_.size(); }
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -148,6 +143,11 @@ class TextureCache {
     const TextureBinding* binding =
         GetValidTextureBinding(fetch_constant_index);
     return binding ? binding->swizzled_signs : kSwizzledSignsUnsigned;
+  }
+  uint32_t GetActiveIntegerScaleBits(uint32_t fetch_constant_index) const {
+    const TextureBinding* binding =
+        GetValidTextureBinding(fetch_constant_index);
+    return binding ? binding->integer_scale_bits : 0;
   }
   bool IsActiveTextureResolutionScaled(uint32_t fetch_constant_index) const {
     const TextureBinding* binding =
@@ -173,8 +173,6 @@ class TextureCache {
   }
 
  protected:
-  void RequestTextures(uint32_t used_texture_mask, bool load_data);
-
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
     // constants so fewer bits can be used, while the maximum size (8192 for 2D)
@@ -208,13 +206,8 @@ class TextureCache {
     uint32_t is_valid : 1;  // 98
 
     TextureKey() { MakeInvalid(); }
-    TextureKey(const TextureKey& key) {
-      std::memcpy(this, &key, sizeof(*this));
-    }
-    TextureKey& operator=(const TextureKey& key) {
-      std::memcpy(this, &key, sizeof(*this));
-      return *this;
-    }
+    TextureKey(const TextureKey&) = default;
+    TextureKey& operator=(const TextureKey&) = default;
     void MakeInvalid() {
       // Zero everything, including the padding, for a stable hash.
       std::memset(this, 0, sizeof(*this));
@@ -233,12 +226,9 @@ class TextureCache {
     }
 
     // Returns true if this is a wide 1D texture (> 8192 wide) mapped to 2D.
-    // For wide 1D textures, height_minus_1 stores the number of rows - 1.
     bool IsWide1D() const {
       return dimension == xenos::DataDimension::k1D && height_minus_1 > 0;
     }
-
-    // For wide 1D textures, returns total 1D width; otherwise GetWidth().
     uint32_t Get1DWidth() const {
       if (IsWide1D()) {
         return GetWidth() * GetHeight();
@@ -258,6 +248,10 @@ class TextureCache {
     }
     void LogAction(const char* action) const;
   };
+  static_assert(
+      std::is_trivially_copyable_v<TextureKey>,
+      "TextureKey is compared and hashed by raw bytes; a trivial copy "
+      "is required so padding is carried and stays zero.");
 
   class Texture {
    public:
@@ -302,10 +296,7 @@ class TextureCache {
     // not).
     bool base_outdated_lockless() const { return base_outdated_; }
     bool mips_outdated_lockless() const { return mips_outdated_; }
-    void MakeUpToDateAndWatch(const global_unique_lock_type& global_lock);
-    void MakeLoadedDataUpToDateAndWatch(
-        const global_unique_lock_type& global_lock, bool loaded_base,
-        bool loaded_mips);
+    bool MakeUpToDateAndWatch(const global_unique_lock_type& global_lock);
 
     void WatchCallback(const global_unique_lock_type& global_lock, bool is_mip);
 
@@ -531,6 +522,9 @@ class TextureCache {
 
   struct TextureBinding {
     TextureKey key;
+    // Packed integer scale, 6 bits per component.
+    // Bit 24 for normalized values.
+    uint32_t integer_scale_bits;
     // Destination swizzle merged with guest to host format swizzle.
     uint32_t host_swizzle;
     // Packed TextureSign values, 2 bit per each component, with guest-side
@@ -564,7 +558,6 @@ class TextureCache {
   // to the implementation that are used in their destructor, and will become
   // invalid if the implementation is destroyed before the texture.
   void DestroyAllTextures(bool from_destructor = false);
-  bool DestroyOldestTextureIfUnused(uint64_t completed_submission_index);
 
   // Whether the signed version of the texture has a different representation on
   // the host than its unsigned version (for example, if it's a fixed-point
@@ -609,25 +602,14 @@ class TextureCache {
     assert_true(load_shader_index < kLoadShaderCount);
     return load_shader_info_[load_shader_index];
   }
+  // Integer num_format on fixed textures. Returns the packed scale used by the
+  // shader to restore guest integer units from normalized host samples.
+  static uint32_t GetIntegerScaleBits(xenos::TextureFormat guest_format,
+                                      uint32_t num_format,
+                                      uint32_t guest_swizzle,
+                                      uint8_t swizzled_signs);
   bool LoadTextureData(Texture& texture);
   void LoadTexturesData(Texture** textures, uint32_t n_textures);
-  virtual bool PrepareTextureDataLoadRanges(Texture** textures,
-                                            uint32_t texture_count,
-                                            uint64_t base_outdated_mask,
-                                            uint64_t mips_outdated_mask) {
-    return true;
-  }
-  enum class TextureDataRangeSource {
-    kBase,
-    kMips,
-  };
-  virtual bool RequestTextureDataRange(Texture&, TextureDataRangeSource,
-                                       uint32_t start, uint32_t length) {
-    // TODO(xenios-jp): Backend texture caches with encoder-lifetime ownership
-    // must not use this default direct shared-memory request while an encoder
-    // is active. Metal routes texture residency through backend preflight.
-    return shared_memory().RequestRange(start, length);
-  }
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data
@@ -635,9 +617,6 @@ class TextureCache {
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                      bool load_base,
                                                      bool load_mips) = 0;
-  global_unique_lock_type AcquireGlobalLock() {
-    return global_critical_region_.Acquire();
-  }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -650,8 +629,6 @@ class TextureCache {
   // this will cause another attempt to create a texture or to untile it if
   // there was an error.
   void ResetTextureBindings(bool from_destructor = false);
-  bool IsBindingOutdatedForUse(const TextureBinding& binding) const;
-  void InvalidateUsedOutdatedBindings(uint32_t used_texture_mask);
 
   const TextureBinding* GetValidTextureBinding(
       uint32_t fetch_constant_index) const {
@@ -662,19 +639,27 @@ class TextureCache {
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {}
 
+  // Checks if there are any pages that contain scaled resolve data within the
+  // range.
+  bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+
+  // Whether the mips of a scaled resolve texture must be generated on the host
+  // (the guest did not resolve them into scaled memory itself).
+  bool ScaledResolveMipsNeedGeneration(const Texture& texture) {
+    const TextureKey& key = texture.key();
+    return key.scaled_resolve && key.mip_max_level != 0 &&
+           !IsRangeScaledResolved(key.mip_page << 12,
+                                  texture.GetGuestMipsSize());
+  }
+
  private:
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
-  TextureKey GetHostTextureKey(TextureKey key) const;
 
   // Shared memory callback for texture data invalidation.
   static void WatchCallback(const global_unique_lock_type& global_lock,
                             void* context, void* data, uint64_t argument,
                             bool invalidated_by_gpu);
 
-  // Checks if there are any pages that contain scaled resolve data within the
-  // range.
-  bool IsRangeScaledResolved(uint32_t start_unscaled,
-                             uint32_t length_unscaled) const;
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(

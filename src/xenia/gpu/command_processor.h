@@ -368,6 +368,7 @@ class CommandProcessor {
     uint32_t slot_base = 0;
     uint32_t begin_record = 0;
     uint32_t end_record = 0;
+    uint32_t scale_area = 0;
     bool segment_active = false;
     bool segment_pending_begin = false;
     bool logical_active = false;
@@ -432,11 +433,16 @@ class CommandProcessor {
   // The logical report stays open and a new segment will open at the next
   // opportunity.
   void CloseQuerySegment();
+  // Splits the open segment when the draw scale changes so each segment
+  // normalizes with one scale.
+  void UpdateZPDScale(uint32_t scale_area);
 
   // Called by backends when a host query resolve completes.  Accumulates
-  // the raw sample count, and if all segments are done, commits the report
-  // to guest memory.
+  // the normalized sample count, and if all segments are done, commits the
+  // report to guest memory.
   void OnZPDQueryResolved(ReportHandle report_handle, uint64_t raw_samples);
+  void OnZPDQueryResolved(ReportHandle report_handle, uint64_t raw_samples,
+                          uint32_t scale_area);
 
   // Writes guest report with begin_value read from guest memory.
   // Orphan END path only when no controller snapshot is available.
@@ -450,6 +456,7 @@ class CommandProcessor {
 
   // Divides host count by draw resolution scale.
   uint32_t NormalizeSampleCount(uint64_t samples) const;
+  static uint32_t NormalizeSampleCount(uint64_t samples, uint32_t scale_area);
 
   // Writes the final report to guest memory and advances the slot running
   // total.  Called when a report fully resolves or is abandoned.
@@ -481,9 +488,14 @@ class CommandProcessor {
 #include "pm4_command_processor_declare.h"
 
   virtual Shader* LoadShader(xenos::ShaderType shader_type,
+                             uint32_t guest_address,
                              const uint32_t* host_address,
                              uint32_t dword_count) {
     return nullptr;
+  }
+  Shader* LoadShader(xenos::ShaderType shader_type,
+                     const uint32_t* host_address, uint32_t dword_count) {
+    return LoadShader(shader_type, 0, host_address, dword_count);
   }
 
   virtual bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
@@ -493,12 +505,14 @@ class CommandProcessor {
   }
   virtual bool IssueCopy() { return false; }
 
+ public:
   // Debug marker stubs for base class (overridden by D3D12/Vulkan backends).
   bool debug_markers_enabled() const { return false; }
   void PushDebugMarker(const char* format, ...) {}
   void PopDebugMarker() {}
   void InsertDebugMarker(const char* format, ...) {}
 
+ protected:
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
   SwapPostEffect GetActualSwapPostEffect() const {
@@ -544,6 +558,12 @@ class CommandProcessor {
   }
   uint32_t zpd_draw_resolution_scale_y() const {
     return zpd_draw_resolution_scale_y_;
+  }
+  // Scale area for the segment being closed.
+  uint32_t GetZPDScaleArea() const {
+    return zpd_active_segment_.scale_area
+               ? zpd_active_segment_.scale_area
+               : zpd_draw_resolution_scale_x_ * zpd_draw_resolution_scale_y_;
   }
 
   uint32_t fake_zpd_sample_count_ = 0;

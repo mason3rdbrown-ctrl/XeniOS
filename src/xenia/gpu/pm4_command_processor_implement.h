@@ -1322,7 +1322,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
         XELOGE("{}: Packet too small, can't read VGT_DMA_BASE", opcode_name);
         return false;
       }
-      uint32_t vgt_dma_base = reader_.ReadAndSwap<uint32_t>();
+      // Wrap writeback & XPS addresses to their physical backing.
+      uint32_t vgt_dma_base = CpuToGpu(reader_.ReadAndSwap<uint32_t>());
       --count_remaining;
       register_file_->values[XE_GPU_REG_VGT_DMA_BASE] = vgt_dma_base;
       reg::VGT_DMA_SIZE vgt_dma_size;
@@ -1601,7 +1602,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_IM_LOAD(uint32_t packet,
 
   trace_writer_.WriteMemoryRead(CpuToGpu(addr), size_dwords * 4);
   auto shader = COMMAND_PROCESSOR::LoadShader(
-      shader_type, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+      shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr),
+      size_dwords);
   switch (shader_type) {
     case xenos::ShaderType::kVertex:
       active_vertex_shader_ = shader;
@@ -1637,7 +1639,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_IM_LOAD_IMMEDIATE(
         shader_type == xenos::ShaderType::kVertex ? "VS" : "PS", size_dwords);
   }
   auto shader = COMMAND_PROCESSOR::LoadShader(
-      shader_type, reinterpret_cast<uint32_t*>(reader_.read_ptr()),
+      shader_type, 0, reinterpret_cast<uint32_t*>(reader_.read_ptr()),
       size_dwords);
   switch (shader_type) {
     case xenos::ShaderType::kVertex:

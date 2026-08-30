@@ -42,9 +42,7 @@ spv::Id SpirvBuilder::createNoContractionUnaryOp(spv::Op op_code,
                                                  spv::Id type_id,
                                                  spv::Id operand) {
   spv::Id result = createUnaryOp(op_code, type_id, operand);
-  if (!allow_contraction_) {
-    addDecoration(result, spv::DecorationNoContraction);
-  }
+  addDecoration(result, spv::DecorationNoContraction);
   return result;
 }
 
@@ -52,9 +50,7 @@ spv::Id SpirvBuilder::createNoContractionBinOp(spv::Op op_code, spv::Id type_id,
                                                spv::Id operand1,
                                                spv::Id operand2) {
   spv::Id result = createBinOp(op_code, type_id, operand1, operand2);
-  if (!allow_contraction_) {
-    addDecoration(result, spv::DecorationNoContraction);
-  }
+  addDecoration(result, spv::DecorationNoContraction);
   return result;
 }
 
@@ -102,6 +98,16 @@ spv::Id SpirvBuilder::createTriBuiltinCall(spv::Id result_type,
   spv::Id result = instruction->getResultId();
   getBuildPoint()->addInstruction(std::move(instruction));
   return result;
+}
+
+spv::Id SpirvBuilder::smearFloatConstant(float value, spv::Id value_type) {
+  spv::Id scalar = makeFloatConstant(value);
+  if (!isVectorType(value_type)) {
+    return scalar;
+  }
+  std::vector<spv::Id> components(size_t(getNumTypeComponents(value_type)),
+                                  scalar);
+  return makeCompositeConstant(value_type, components);
 }
 
 SpirvBuilder::IfBuilder::IfBuilder(spv::Id condition,

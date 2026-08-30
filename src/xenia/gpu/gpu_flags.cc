@@ -15,13 +15,21 @@
 DEFINE_bool(use_50Hz_mode, false, "Enables usage of PAL-50 mode.", "Console");
 
 DEFINE_path(trace_gpu_prefix, "scratch/gpu/",
-            "Prefix path for GPU trace files.", "GPU");
-DEFINE_bool(trace_gpu_stream, false, "Trace all GPU packets.", "GPU");
+            "Prefix path for GPU trace files.", "GPU.Debug");
+DEFINE_bool(trace_gpu_stream, false, "Trace all GPU packets.", "GPU.Debug");
 
 DEFINE_path(
     dump_shaders, "",
     "For shader debugging, path to dump GPU shaders to as they are compiled.",
-    "GPU");
+    "GPU.Debug");
+
+DEFINE_bool(vsync, true, "Enable VSYNC.", "GPU");
+
+DEFINE_uint64(framerate_limit, 0,
+              "Maximum frames per second. 0 = Unlimited frames.\n"
+              "Defaults to 60, when set to 0, and VSYNC is enabled.",
+              "GPU");
+UPDATE_from_uint64(framerate_limit, 2024, 8, 31, 20, 60);
 
 DEFINE_bool(guest_display_refresh_cap, true,
             "Control guest vblank timing.\n"
@@ -31,19 +39,12 @@ DEFINE_bool(guest_display_refresh_cap, true,
             "possible.",
             "GPU");
 
-DEFINE_uint32(
-    framerate_limit, 0,
-    "Host frame rate limit in FPS. 0 = unlimited.\n"
-    "Throttles presentation without affecting guest vblank timing.\n"
-    "Guest vblanks are controlled by use_50Hz_mode (50Hz PAL, 60Hz NTSC).",
-    "GPU");
-
 void SetGuestDisplayRefreshCap(bool value) {
   OVERRIDE_bool(guest_display_refresh_cap, value);
 }
 
 void SetFramerateLimit(uint32_t value) {
-  OVERRIDE_uint32(framerate_limit, value);
+  OVERRIDE_uint64(framerate_limit, value);
 }
 
 DEFINE_bool(
@@ -63,7 +64,11 @@ DEFINE_bool(
     "Disable filtering between cube map faces near edges where possible "
     "(Vulkan with VK_EXT_non_seamless_cube_map) to reproduce the Direct3D 9 "
     "behavior.",
-    "GPU");
+    "GPU.Debug");
+
+DEFINE_bool(vulkan_precise_interpolation, false,
+            "Use precise shader interpolation on Vulkan where supported.",
+            "GPU.Debug");
 
 // Extremely bright screen borders in 4D5307E6.
 // Reading between texels with half-pixel offset in 58410954.
@@ -77,7 +82,7 @@ DEFINE_bool(
     "textures, for instance, when they are read between texels rather than "
     "at texel centers, or the leftmost/topmost pixels may not be fully covered "
     "when MSAA is used with fullscreen passes.",
-    "GPU");
+    "GPU.Debug");
 
 DEFINE_int32(occlusion_query_fake_lower_threshold, 80,
              "Lower end of the fake sample count value written on "
@@ -101,17 +106,16 @@ DEFINE_bool(
     "issues with fast mode.",
     "GPU");
 DEFINE_int32(occlusion_query_querybatch_range, 0,
-             "Range of fake sample count values to walk for titles using the\n"
-             "D3D QueryBatch standard before wrapping back to\n"
-             "occlusion_query_fake_lower_threshold. This shouldn't be changed\n"
-             "from the default value of 0 (disabled) unless necessary for a\n"
-             "specific title.",
+             "Range of fake sample count values to walk for titles using the "
+             "D3D QueryBatch standard before wrapping back to "
+             "occlusion_query_fake_lower_threshold.\n"
+             "This shouldn't be changed from the default value of 0 (disabled) "
+             "unless necessary for a specific title.",
              "GPU");
 DEFINE_double(
     occlusion_query_saturation, 1.0,
     "Compress higher occlusion query sample counts before guest writeback.\n"
-    "This can be useful if effects such as lens flares appear too bright\n"
-    "or too strong.\n"
+    "This can be useful if effects such as lens flares appear too strong.\n"
     "1.0 = default behavior\n"
     "0.0 = collapse all nonzero sample counts to 1\n"
     "Values around 0.90 are a good starting point for subtle tuning.",
@@ -128,7 +132,6 @@ DEFINE_bool(
     "GPU");
 
 bool IsGpuDebugMarkersEnabled() {
-  // Cache the result - RenderDoc detection only needs to happen once.
   static bool cached = false;
   static bool result = false;
   if (!cached) {
@@ -147,9 +150,6 @@ bool IsGpuDebugMarkersEnabled() {
   return result;
 }
 
-// TODO(Triang3l): Make accuracy (ROV/FSI) the default when it's optimized
-// better (for instance, using static shader modifications to pass render
-// target parameters).
 DEFINE_string(
     render_target_path, "performance",
     "Render target emulation path to use across all GPU backends.\n"
@@ -171,14 +171,36 @@ DEFINE_string(
     "  Maps to 'fsi' on Vulkan and 'rov' on D3D12.",
     "GPU");
 
+DEFINE_int32(anisotropic_override, -1,
+             "Forces anisotropic filtering (AF) for eligible textures.\n"
+             "Higher values keep textures sharper at oblique angles at the "
+             "cost of GPU bandwidth, though most GPUs handle up to 16x fine.\n"
+             "In rare cases, forcing AF can introduce visual artifacts.\n"
+             " -1 = No override\n"
+             "  0 = Disable anisotropic filtering\n"
+             "  1 = Force 1x anisotropic filtering\n"
+             "  2 = Force 2x anisotropic filtering\n"
+             "  3 = Force 4x anisotropic filtering\n"
+             "  4 = Force 8x anisotropic filtering\n"
+             "  5 = Force 16x anisotropic filtering",
+             "GPU");
+
+DEFINE_bool(no_discard_stencil_in_transfer_pipelines, false,
+            "Skip stencil bit discard in render target transfer pipelines. "
+            "May improve performance on some GPUs.",
+            "GPU.Debug");
+
 DEFINE_bool(submit_on_primary_buffer_end, true,
             "Submit the command buffer when a PM4 primary buffer ends if it's "
             "possible to submit immediately to try to reduce frame latency.",
             "GPU");
 
-DEFINE_bool(no_discard_stencil_in_transfer_pipelines, false,
-            "Skip stencil bit discard in render target transfer pipelines. "
-            "May improve performance on some GPUs.",
+DEFINE_bool(force_convert_triangle_strips_to_lists, false,
+            "Convert triangle strips to lists before drawing.", "GPU.Debug");
+
+DEFINE_bool(gpu_3d_to_2d_texture, true,
+            "Handle shaders that sample 3D textures as 2D by creating a 2D "
+            "texture from slice 0 of the guest memory.",
             "GPU");
 
 DEFINE_bool(
@@ -197,25 +219,6 @@ DEFINE_bool(
     "improve image quality in some cases but can break games that rely on "
     "reading back specific pixel values (e.g., for gamma detection).",
     "GPU");
-
-DEFINE_bool(gpu_3d_to_2d_texture, true,
-            "Handle shaders that sample 3D textures as 2D by creating a 2D "
-            "texture from slice 0 of the guest memory.",
-            "GPU");
-
-DEFINE_int32(anisotropic_override, -1,
-             "Forces anisotropic filtering (AF) for eligible textures.\n"
-             "Higher values keep textures sharper at oblique angles at the "
-             "cost of GPU bandwidth, though most GPUs handle up to 16x fine.\n"
-             "In rare cases, forcing AF can introduce visual artifacts.\n"
-             " -1 = No override\n"
-             "  0 = Disable anisotropic filtering\n"
-             "  1 = Force 1x anisotropic filtering\n"
-             "  2 = Force 2x anisotropic filtering\n"
-             "  3 = Force 4x anisotropic filtering\n"
-             "  4 = Force 8x anisotropic filtering\n"
-             "  5 = Force 16x anisotropic filtering",
-             "GPU");
 
 DEFINE_bool(metal_shader_disk_cache, true,
             "Cache translated Metal shader artifacts and binding metadata in "
@@ -269,3 +272,10 @@ DEFINE_bool(
     "This fixes(hide) issues with black ground in AC6. Use only in AC6. "
     "Might cause issues in other titles.",
     "HACKS");
+
+DEFINE_bool(
+    force_depth_clamp, false,
+    "Use host depth clamping instead of near and far plane clipping when "
+    "guest clipping is enabled. X/Y/W clipping is unaffected. On Vulkan, "
+    "this requires depthClamp support.",
+    "GPU");

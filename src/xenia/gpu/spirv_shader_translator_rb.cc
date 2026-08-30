@@ -645,6 +645,22 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
             block_rt_0_alpha_tests_rt_written_head->getId());
         main_fsi_sample_mask_ =
             builder_->createOp(spv::OpPhi, type_uint_, id_vector_temp_);
+      } else if (edram_fragment_shader_interlock_) {
+        // Demote path: the alpha test demotes instead of touching the mask, but
+        // alpha to coverage still modified main_fsi_sample_mask_ inside the
+        // written branch. Merge in fsi_sample_mask_in_rt_0_alpha_tests, the
+        // mask from before the branch, on the edge where the render target
+        // wasn't written so the value dominates the merge. Otherwise it is
+        // undefined there (invalid SPIR-V dominance and garbage coverage).
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(main_fsi_sample_mask_);
+        id_vector_temp_.push_back(
+            block_rt_0_alpha_tests_rt_written_end.getId());
+        id_vector_temp_.push_back(fsi_sample_mask_in_rt_0_alpha_tests);
+        id_vector_temp_.push_back(
+            block_rt_0_alpha_tests_rt_written_head->getId());
+        main_fsi_sample_mask_ =
+            builder_->createOp(spv::OpPhi, type_uint_, id_vector_temp_);
       }
     }
   }
@@ -1272,7 +1288,8 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
             const_uint_0_);
         SpirvBuilder::IfBuilder if_gamma(
             is_gamma, spv::SelectionControlDontFlattenMask, *builder_);
-        spv::Id color_rgb_gamma = LinearToPWLGamma(color_rgb, false);
+        spv::Id color_rgb_gamma = SpirvShaderTranslator::LinearToPWLGamma(
+            builder_.get(), color_rgb, false, ext_inst_glsl_std_450_);
         if_gamma.makeEndIf();
         color_rgb = if_gamma.createMergePhi(color_rgb_gamma, color_rgb);
         {
@@ -1614,7 +1631,6 @@ void SpirvShaderTranslator::CompleteFragmentShader_DSV_DepthTo24Bit() {
     builder_->createStore(depth_remapped, output_fragment_depth_);
     return;
   }
-
   // Float24 mode: statically known float24 host buffer; perform the conversion.
   Modification::DepthStencilMode mode =
       GetSpirvShaderModification().pixel.depth_stencil_mode;
@@ -1684,11 +1700,11 @@ spv::Id SpirvShaderTranslator::LoadMsaaSamplesFromFlags() {
 void SpirvShaderTranslator::FSI_LoadSampleMask(spv::Id msaa_samples) {
   // On the Xbox 360, 2x MSAA doubles the storage height, 4x MSAA doubles the
   // storage width.
-  // Vulkan standard 2x samples are bottom, top.
-  // Vulkan standard 4x samples are TL, TR, BL, BR.
-  // Remap to T, B for 2x, and to TL, BL, TR, BR for 4x.
-  // 2x corresponds to 1, 0 with native 2x MSAA on Vulkan, 0, 3 with 2x as 4x.
-  // 4x corresponds to 0, 2, 1, 3 on Vulkan.
+  // The guest 4x sample numbering is the Vulkan one, bit 0 horizontal and
+  // bit 1 vertical, so 4x coverage passes through as is. Guest 2x puts
+  // sample 0 at the top while Vulkan counts from the bottom, so the guest
+  // samples map to Vulkan 1, 0 with native 2x MSAA and to 0, 3 with 2x
+  // emulated as 4x.
 
   spv::Id const_uint_1 = builder_->makeUintConstant(1);
   spv::Id const_uint_2 = builder_->makeUintConstant(2);
@@ -1741,28 +1757,20 @@ void SpirvShaderTranslator::FSI_LoadSampleMask(spv::Id msaa_samples) {
                                 input_sample_mask_value),
         builder_->makeUintConstant(32 - 2));
   } else {
-    // 0 and 3 to 0 and 1.
+    // 0 and 3 to 0 and 1. Guest sample 1 comes from host sample 3.
     sample_mask_2x = builder_->createQuadOp(
         spv::OpBitFieldInsert, type_uint_, input_sample_mask_value,
         builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
-                              input_sample_mask_value, const_uint_2,
-                              const_uint_1),
+                              input_sample_mask_value,
+                              builder_->makeUintConstant(3), const_uint_1),
         const_uint_1, builder_->makeUintConstant(32 - 1));
   }
   builder_->createBranch(&block_msaa_merge);
 
-  // 4x MSAA.
+  // At 4x the guest and the Vulkan sample numbering match, so pass the
+  // coverage through.
   builder_->setBuildPoint(&block_msaa_4x);
-  // Flip samples in bits 0:1 by reversing the whole coverage mask and inserting
-  // the reversing bits.
-  spv::Id sample_mask_4x = builder_->createQuadOp(
-      spv::OpBitFieldInsert, type_uint_, input_sample_mask_value,
-      builder_->createBinOp(
-          spv::OpShiftRightLogical, type_uint_,
-          builder_->createUnaryOp(spv::OpBitReverse, type_uint_,
-                                  input_sample_mask_value),
-          builder_->makeUintConstant(32 - 1 - 2)),
-      const_uint_1, const_uint_2);
+  spv::Id sample_mask_4x = input_sample_mask_value;
   builder_->createBranch(&block_msaa_merge);
 
   // Select the result depending on the MSAA sample count.
@@ -1780,32 +1788,87 @@ void SpirvShaderTranslator::FSI_LoadSampleMask(spv::Id msaa_samples) {
 }
 
 void SpirvShaderTranslator::FSI_LoadEdramOffsets(spv::Id msaa_samples) {
-  // Convert the floating-point pixel coordinates to integer sample 0
-  // coordinates.
+  // Convert the floating-point pixel coordinates to the canonical sample 0
+  // coordinates, meaning the coordinates of the pixel's sample 0 in the
+  // single sampled view of the EDRAM data. The layout is described in
+  // XeEdramOffsetBytes (see edram.xesli). What matters here is that the offsets
+  // of the other samples from sample 0 are constant, FSI_AddSampleOffset
+  // adds them, and that with resolution scaling the rearrangement happens at
+  // guest pixel granularity.
   assert_true(input_fragment_coordinates_ != spv::NoResult);
-  spv::Id axes_have_two_msaa_samples[2];
-  spv::Id sample_coordinates[2];
   spv::Id const_uint_1 = builder_->makeUintConstant(1);
+  spv::Id const_uint_2 = builder_->makeUintConstant(2);
+  spv::Id msaa_is_4x = builder_->createBinOp(
+      spv::OpUGreaterThanEqual, type_bool_, msaa_samples,
+      builder_->makeUintConstant(uint32_t(xenos::MsaaSamples::k4X)));
+  spv::Id msaa_is_2x_or_4x = builder_->createBinOp(
+      spv::OpUGreaterThanEqual, type_bool_, msaa_samples,
+      builder_->makeUintConstant(uint32_t(xenos::MsaaSamples::k2X)));
+  const uint32_t resolution_scale[2] = {draw_resolution_scale_x_,
+                                        draw_resolution_scale_y_};
+  spv::Id guest_pixel[2], guest_subpixel[2];
   for (uint32_t i = 0; i < 2; ++i) {
-    spv::Id axis_has_two_msaa_samples = builder_->createBinOp(
-        spv::OpUGreaterThanEqual, type_bool_, msaa_samples,
-        builder_->makeUintConstant(
-            uint32_t(i ? xenos::MsaaSamples::k2X : xenos::MsaaSamples::k4X)));
-    axes_have_two_msaa_samples[i] = axis_has_two_msaa_samples;
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeIntConstant(int32_t(i)));
-    sample_coordinates[i] = builder_->createBinOp(
-        spv::OpShiftLeftLogical, type_uint_,
-        builder_->createUnaryOp(
-            spv::OpConvertFToU, type_uint_,
-            builder_->createLoad(
-                builder_->createAccessChain(spv::StorageClassInput,
-                                            input_fragment_coordinates_,
-                                            id_vector_temp_),
-                spv::NoPrecision)),
-        builder_->createTriOp(spv::OpSelect, type_uint_,
-                              axis_has_two_msaa_samples, const_uint_1,
-                              const_uint_0_));
+    spv::Id host_pixel = builder_->createUnaryOp(
+        spv::OpConvertFToU, type_uint_,
+        builder_->createLoad(builder_->createAccessChain(
+                                 spv::StorageClassInput,
+                                 input_fragment_coordinates_, id_vector_temp_),
+                             spv::NoPrecision));
+    if (resolution_scale[i] > 1) {
+      spv::Id const_scale = builder_->makeUintConstant(resolution_scale[i]);
+      guest_pixel[i] = builder_->createBinOp(spv::OpUDiv, type_uint_,
+                                             host_pixel, const_scale);
+      guest_subpixel[i] = builder_->createBinOp(spv::OpUMod, type_uint_,
+                                                host_pixel, const_scale);
+    } else {
+      guest_pixel[i] = host_pixel;
+      guest_subpixel[i] = spv::NoResult;
+    }
+  }
+  // (((x or y) >> 1) << 2) | ((x or y) & 1), the sample 0 part of the
+  // rearrangement shared by the 4x u and v and the 2x v.
+  auto expand_pixel_low_bit = [&](spv::Id pixel_x_or_y) {
+    return builder_->createQuadOp(
+        spv::OpBitFieldInsert, type_uint_,
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, pixel_x_or_y,
+                              const_uint_1),
+        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                              pixel_x_or_y, const_uint_1),
+        const_uint_2, builder_->makeUintConstant(30));
+  };
+  // u0 is ((x >> 1) << 2) | (x & 1) at 4x, x & ~2 at 2x and plain x at 1x.
+  spv::Id sample_u = builder_->createTriOp(
+      spv::OpSelect, type_uint_, msaa_is_4x,
+      expand_pixel_low_bit(guest_pixel[0]),
+      builder_->createTriOp(
+          spv::OpSelect, type_uint_, msaa_is_2x_or_4x,
+          builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, guest_pixel[0],
+                                builder_->makeUintConstant(~uint32_t(2))),
+          guest_pixel[0]));
+  // v0 is ((y >> 1) << 2) | (y & 1) at 2x and 4x, with x bit 1 in bit 1 at
+  // 2x only. At 1x it's plain y.
+  spv::Id sample_v = builder_->createTriOp(
+      spv::OpSelect, type_uint_, msaa_is_2x_or_4x,
+      builder_->createBinOp(
+          spv::OpBitwiseOr, type_uint_, expand_pixel_low_bit(guest_pixel[1]),
+          builder_->createTriOp(
+              spv::OpSelect, type_uint_, msaa_is_4x, const_uint_0_,
+              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                    guest_pixel[0], const_uint_2))),
+      guest_pixel[1]);
+  // Restore the host pixel granularity.
+  spv::Id sample_coordinates[2] = {sample_u, sample_v};
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (resolution_scale[i] > 1) {
+      sample_coordinates[i] = builder_->createBinOp(
+          spv::OpIAdd, type_uint_,
+          builder_->createBinOp(
+              spv::OpIMul, type_uint_, sample_coordinates[i],
+              builder_->makeUintConstant(resolution_scale[i])),
+          guest_subpixel[i]);
+    }
   }
 
   // Get 40 x 16 x resolution scale 32bpp half-tile or 40x16 64bpp tile index.
@@ -1928,24 +1991,26 @@ spv::Id SpirvShaderTranslator::FSI_AddSampleOffset(spv::Id sample_0_address,
   if (!sample_index) {
     return sample_0_address;
   }
-  spv::Id sample_offset;
-  // Apply resolution scaling to tile width.
+  // In the canonical layout, the horizontal (or the only 2x) sample bit is
+  // +2 sample columns from sample 0, 2 dwords wide each for 64bpp, and the
+  // vertical sample bit is +2 sample rows, all at the guest scale.
   uint32_t tile_width =
       xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
-  if (sample_index == 1) {
-    sample_offset = builder_->makeIntConstant(tile_width);
+  uint32_t sample_row_offset =
+      2 * draw_resolution_scale_y_ * tile_width * (sample_index >> 1);
+  uint32_t sample_column_offset_32bpp =
+      2 * draw_resolution_scale_x_ * (sample_index & 1);
+  spv::Id sample_offset;
+  if ((sample_index & 1) && is_64bpp != spv::NoResult) {
+    sample_offset = builder_->createTriOp(
+        spv::OpSelect, type_int_, is_64bpp,
+        builder_->makeIntConstant(
+            int32_t(sample_row_offset + 2 * sample_column_offset_32bpp)),
+        builder_->makeIntConstant(
+            int32_t(sample_row_offset + sample_column_offset_32bpp)));
   } else {
-    spv::Id sample_offset_32bpp = builder_->makeIntConstant(
-        tile_width * (sample_index & 1) + (sample_index >> 1));
-    if (is_64bpp != spv::NoResult) {
-      sample_offset = builder_->createTriOp(
-          spv::OpSelect, type_int_, is_64bpp,
-          builder_->makeIntConstant(tile_width * (sample_index & 1) +
-                                    2 * (sample_index >> 1)),
-          sample_offset_32bpp);
-    } else {
-      sample_offset = sample_offset_32bpp;
-    }
+    sample_offset = builder_->makeIntConstant(
+        int32_t(sample_row_offset + sample_column_offset_32bpp));
   }
   return builder_->createBinOp(spv::OpIAdd, type_int_, sample_0_address,
                                sample_offset);
@@ -2311,14 +2376,15 @@ void SpirvShaderTranslator::FSI_DepthStencilTest(
         }
       } break;
       case 1: {
-        // For guest 2x: bottom-right sample (bottom - 0 in Vulkan - for native
-        // 2x, bottom-right - 3 in Vulkan - for 2x as 4x).
-        // For guest 4x: bottom-left sample (2 in Vulkan).
+        // For guest 2x this is the bottom sample, Vulkan 0 for native 2x and
+        // Vulkan 3 for 2x as 4x.
+        // For guest 4x this is the top-right sample since the horizontal
+        // sample bit is bit 0, Vulkan 1.
         for (uint32_t j = 0; j < 2; ++j) {
           sample_location[j] = builder_->createTriOp(
               spv::OpSelect, type_float_, msaa_is_4x,
               builder_->makeFloatConstant(
-                  draw_util::kD3D10StandardSamplePositions4x[2][j] *
+                  draw_util::kD3D10StandardSamplePositions4x[1][j] *
                   (1.0f / 16.0f)),
               builder_->makeFloatConstant(
                   (native_2x_msaa_no_attachments_
@@ -2328,10 +2394,10 @@ void SpirvShaderTranslator::FSI_DepthStencilTest(
         }
       } break;
       default: {
-        // Xenia samples 2 and 3 (top-right and bottom-right) -> Vulkan samples
-        // 1 and 3.
-        const int8_t* sample_location_int = draw_util::
-            kD3D10StandardSamplePositions4x[i ^ (((i & 1) ^ (i >> 1)) * 0b11)];
+        // Guest samples 2 and 3, bottom-left and bottom-right with the
+        // vertical sample bit being bit 1, map to Vulkan samples 2 and 3.
+        const int8_t* sample_location_int =
+            draw_util::kD3D10StandardSamplePositions4x[i];
         for (uint32_t j = 0; j < 2; ++j) {
           sample_location[j] = builder_->makeFloatConstant(
               sample_location_int[j] * (1.0f / 16.0f));
@@ -2680,6 +2746,132 @@ void SpirvShaderTranslator::FSI_DepthStencilTest(
   }
 }
 
+spv::Id SpirvShaderTranslator::PackFloat16x2ExtendedRange(
+    spv::Id float2_value) {
+  // The Xbox 360 float16 has no NaN, map it to 0. Also keeps the overflow
+  // detection below from misreading a NaN's exponent 31 as a finite extended
+  // value, and FClamp's NaN result is undefined.
+  float2_value = builder_->createTriOp(
+      spv::OpSelect, type_float2_,
+      builder_->createUnaryOp(spv::OpIsNan, type_bool2_, float2_value),
+      const_float2_0_, float2_value);
+  // The standard conversion covers magnitudes up to 65504. Anything larger
+  // overflows to Inf (exponent field 0x7C00). Re-encode the overflowed lanes
+  // using the extended range: halve into the standard range, convert
+  // (exponent <= 30), then bump the exponent by 1 into the exponent 31 slot
+  // the Xbox 360 treats as finite.
+  spv::Id standard = builder_->createUnaryBuiltinCall(
+      type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16, float2_value);
+  spv::Id const_0x7C00 = builder_->makeUintConstant(0x7C00);
+  spv::Id lower_overflow =
+      builder_->createBinOp(spv::OpIEqual, type_bool_,
+                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                                  standard, const_0x7C00),
+                            const_0x7C00);
+  spv::Id upper_overflow = builder_->createBinOp(
+      spv::OpIEqual, type_bool_,
+      builder_->createBinOp(
+          spv::OpBitwiseAnd, type_uint_,
+          builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, standard,
+                                builder_->makeUintConstant(16)),
+          const_0x7C00),
+      const_0x7C00);
+  id_vector_temp_.clear();
+  id_vector_temp_.resize(2, builder_->makeFloatConstant(-131008.0f));
+  spv::Id const_neg_131008 =
+      builder_->makeCompositeConstant(type_float2_, id_vector_temp_);
+  id_vector_temp_.clear();
+  id_vector_temp_.resize(2, builder_->makeFloatConstant(131008.0f));
+  spv::Id const_131008 =
+      builder_->makeCompositeConstant(type_float2_, id_vector_temp_);
+  spv::Id clamped = builder_->createTriBuiltinCall(
+      type_float2_, ext_inst_glsl_std_450_, GLSLstd450FClamp, float2_value,
+      const_neg_131008, const_131008);
+  id_vector_temp_.clear();
+  id_vector_temp_.resize(2, builder_->makeFloatConstant(0.5f));
+  spv::Id halved = builder_->createBinOp(
+      spv::OpFMul, type_float2_, clamped,
+      builder_->makeCompositeConstant(type_float2_, id_vector_temp_));
+  spv::Id halved_packed = builder_->createUnaryBuiltinCall(
+      type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16, halved);
+  // halved_packed has exponent <= 30 in both lanes, so adding 0x0400 per lane
+  // bumps the exponent without ever carrying across lanes.
+  spv::Id extended =
+      builder_->createBinOp(spv::OpIAdd, type_uint_, halved_packed,
+                            builder_->makeUintConstant(0x04000400));
+  spv::Id const_0xFFFF = builder_->makeUintConstant(0xFFFF);
+  spv::Id const_0xFFFF0000 = builder_->makeUintConstant(0xFFFF0000);
+  spv::Id result_lower =
+      builder_->createTriOp(spv::OpSelect, type_uint_, lower_overflow,
+                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                                  extended, const_0xFFFF),
+                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                                  standard, const_0xFFFF));
+  spv::Id result_upper =
+      builder_->createTriOp(spv::OpSelect, type_uint_, upper_overflow,
+                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                                  extended, const_0xFFFF0000),
+                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                                  standard, const_0xFFFF0000));
+  return builder_->createBinOp(spv::OpBitwiseOr, type_uint_, result_lower,
+                               result_upper);
+}
+
+spv::Id SpirvShaderTranslator::UnpackFloat16x2ExtendedRange(
+    spv::Id packed_uint) {
+  // Inverse of PackFloat16x2ExtendedRange. Exponent 31 lanes are large finite
+  // values rather than Inf or NaN. Decrement their exponent by 1 into the
+  // standard range, unpack, then double to compensate.
+  spv::Id const_0x7C00 = builder_->makeUintConstant(0x7C00);
+  spv::Id lower_overflow =
+      builder_->createBinOp(spv::OpIEqual, type_bool_,
+                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                                  packed_uint, const_0x7C00),
+                            const_0x7C00);
+  spv::Id upper_overflow = builder_->createBinOp(
+      spv::OpIEqual, type_bool_,
+      builder_->createBinOp(
+          spv::OpBitwiseAnd, type_uint_,
+          builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                packed_uint, builder_->makeUintConstant(16)),
+          const_0x7C00),
+      const_0x7C00);
+  spv::Id standard =
+      builder_->createUnaryBuiltinCall(type_float2_, ext_inst_glsl_std_450_,
+                                       GLSLstd450UnpackHalf2x16, packed_uint);
+  // Decrement the exponent only in overflowed lanes (0x0400 in the low lane,
+  // 0x04000000 in the high one) so the subtraction never borrows across lanes.
+  spv::Id sub_lower =
+      builder_->createTriOp(spv::OpSelect, type_uint_, lower_overflow,
+                            builder_->makeUintConstant(0x0400), const_uint_0_);
+  spv::Id sub_upper = builder_->createTriOp(
+      spv::OpSelect, type_uint_, upper_overflow,
+      builder_->makeUintConstant(0x04000000), const_uint_0_);
+  spv::Id reduced =
+      builder_->createBinOp(spv::OpISub, type_uint_, packed_uint,
+                            builder_->createBinOp(spv::OpBitwiseOr, type_uint_,
+                                                  sub_lower, sub_upper));
+  spv::Id reduced_unpacked = builder_->createUnaryBuiltinCall(
+      type_float2_, ext_inst_glsl_std_450_, GLSLstd450UnpackHalf2x16, reduced);
+  id_vector_temp_.clear();
+  id_vector_temp_.resize(2, builder_->makeFloatConstant(2.0f));
+  spv::Id extended = builder_->createBinOp(
+      spv::OpFMul, type_float2_, reduced_unpacked,
+      builder_->makeCompositeConstant(type_float2_, id_vector_temp_));
+  spv::Id result_x = builder_->createTriOp(
+      spv::OpSelect, type_float_, lower_overflow,
+      builder_->createCompositeExtract(extended, type_float_, 0),
+      builder_->createCompositeExtract(standard, type_float_, 0));
+  spv::Id result_y = builder_->createTriOp(
+      spv::OpSelect, type_float_, upper_overflow,
+      builder_->createCompositeExtract(extended, type_float_, 1),
+      builder_->createCompositeExtract(standard, type_float_, 1));
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(result_x);
+  id_vector_temp_.push_back(result_y);
+  return builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
+}
+
 std::array<spv::Id, 2> SpirvShaderTranslator::FSI_ClampAndPackColor(
     spv::Id color_float4, spv::Id format_with_flags) {
   spv::Block& block_format_head = *builder_->getBuildPoint();
@@ -2797,10 +2989,11 @@ std::array<spv::Id, 2> SpirvShaderTranslator::FSI_ClampAndPackColor(
     uint_vector_temp_.push_back(2);
     spv::Id color_rgb = builder_->createRvalueSwizzle(
         spv::NoPrecision, type_float3_, color_float4, uint_vector_temp_);
-    spv::Id rgb_gamma = LinearToPWLGamma(
+    spv::Id rgb_gamma = SpirvShaderTranslator::LinearToPWLGamma(
+        builder_.get(),
         builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_,
                                       color_float4, uint_vector_temp_),
-        false);
+        false, ext_inst_glsl_std_450_);
     spv::Id alpha_clamped = builder_->createTriBuiltinCall(
         type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
         builder_->createCompositeExtract(color_float4, type_float_, 3),
@@ -2976,31 +3169,14 @@ std::array<spv::Id, 2> SpirvShaderTranslator::FSI_ClampAndPackColor(
   std::array<spv::Id, 2> packed_16_float;
   {
     builder_->setBuildPoint(&block_format_16_float);
-    // TODO(Triang3l): Xenos extended-range float16.
-    id_vector_temp_.clear();
-    id_vector_temp_.resize(4, builder_->makeFloatConstant(-65504.0f));
-    spv::Id const_float4_minus_float16_max =
-        builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
-    id_vector_temp_.clear();
-    id_vector_temp_.resize(4, builder_->makeFloatConstant(65504.0f));
-    spv::Id const_float4_float16_max =
-        builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
-    // NaN to 0, not to -max.
-    spv::Id color_clamped = builder_->createTriBuiltinCall(
-        type_float4_, ext_inst_glsl_std_450_, GLSLstd450FClamp,
-        builder_->createTriOp(
-            spv::OpSelect, type_float4_,
-            builder_->createUnaryOp(spv::OpIsNan, type_bool4_, color_float4),
-            const_float4_0_, color_float4),
-        const_float4_minus_float16_max, const_float4_float16_max);
+    // NaN is flushed to 0 inside PackFloat16x2ExtendedRange.
     for (uint32_t i = 0; i < 2; ++i) {
       uint_vector_temp_.clear();
       uint_vector_temp_.push_back(2 * i);
       uint_vector_temp_.push_back(2 * i + 1);
-      packed_16_float[i] = builder_->createUnaryBuiltinCall(
-          type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16,
-          builder_->createRvalueSwizzle(spv::NoPrecision, type_float2_,
-                                        color_clamped, uint_vector_temp_));
+      packed_16_float[i] =
+          PackFloat16x2ExtendedRange(builder_->createRvalueSwizzle(
+              spv::NoPrecision, type_float2_, color_float4, uint_vector_temp_));
     }
     builder_->createBranch(&block_format_merge);
   }
@@ -3169,7 +3345,8 @@ std::array<spv::Id, 4> SpirvShaderTranslator::FSI_UnpackColor(
                     builder_->makeUintConstant(8 * j), component_width)),
             component_scale);
         if (i && j <= 2) {
-          component = PWLGammaToLinear(component, true);
+          component = SpirvShaderTranslator::PWLGammaToLinear(
+              builder_.get(), component, true, ext_inst_glsl_std_450_);
         }
         unpacked_8_8_8_8_and_gamma[i][j] = component;
       }
@@ -3288,11 +3465,9 @@ std::array<spv::Id, 4> SpirvShaderTranslator::FSI_UnpackColor(
     for (uint32_t i = 0; i < 2; ++i) {
       builder_->setBuildPoint(i ? &block_format_16_16_16_16_float
                                 : &block_format_16_16_float);
-      // TODO(Triang3l): Xenos extended-range float16.
       for (uint32_t j = 0; j <= i; ++j) {
-        spv::Id components_float2 = builder_->createUnaryBuiltinCall(
-            type_float2_, ext_inst_glsl_std_450_, GLSLstd450UnpackHalf2x16,
-            color_packed[j]);
+        spv::Id components_float2 =
+            UnpackFloat16x2ExtendedRange(color_packed[j]);
         for (uint32_t k = 0; k < 2; ++k) {
           unpacked_16_float[i][2 * j + k] = builder_->createCompositeExtract(
               components_float2, type_float_, k);
@@ -4292,8 +4467,11 @@ void SpirvShaderTranslator::FSI_AlphaToMask() {
     FSI_AlphaToMaskSample(false, 1, 1.0f, threshold_offset, 1.0f / 8.0f, alpha,
                           coverage_2x);
   } else {
-    // FBO: Account for native 2x vs 2x-as-4x sample mapping.
-    if (native_2x_msaa_no_attachments_) {
+    // FBO: Account for native 2x vs 2x-as-4x sample mapping. This epilogue only
+    // runs when there is a color attachment (sample mask output), so whether 2x
+    // is native must be taken from the capability with attachments, matching
+    // the choice made for the host pipeline.
+    if (native_2x_msaa_with_attachments_) {
       // Native 2x: D3D10.1+ standard - top is 1, bottom is 0.
       FSI_AlphaToMaskSample(true, 1, 0.5f, threshold_offset, 1.0f / 8.0f, alpha,
                             coverage_2x);

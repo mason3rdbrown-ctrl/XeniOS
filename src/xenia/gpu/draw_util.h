@@ -12,12 +12,10 @@
 
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <utility>
 #include <vector>
 
 #include "xenia/base/assert.h"
-#include "xenia/gpu/primitive_processor.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/shader.h"
 #include "xenia/gpu/trace_writer.h"
@@ -322,6 +320,10 @@ struct GetViewportInfoArgs {
           uint32_t full_float24_in_0_to_1 : 1;
           uint32_t pixel_shader_writes_depth : 1;
           xenos::DepthRenderTargetFormat depth_format : 1;
+          // Compared since with a scale threshold the scale can differ per draw
+          // and a cached viewport has to match it. 3 bits fit max 7 scale.
+          uint32_t draw_resolution_scale_x : 3;
+          uint32_t draw_resolution_scale_y : 3;
         };
         uint32_t packed_portions;
       };
@@ -356,9 +358,7 @@ struct GetViewportInfoArgs {
 #endif
   };
 
-  // everything that follows here does not need to be compared
-  uint32_t draw_resolution_scale_x;
-  uint32_t draw_resolution_scale_y;
+  // everything that follows here does not need to be compared.
   divisors::MagicDiv draw_resolution_scale_x_divisor;
   divisors::MagicDiv draw_resolution_scale_y_divisor;
   void Setup(uint32_t _draw_resolution_scale_x,
@@ -532,6 +532,10 @@ union ResolveEdramInfo {
     // of the resolve region with the contents of the first surely covered
     // column / row with resolution scaling.
     uint32_t fill_half_pixel_offset : 1;
+    // Some games appear overexposed unless full 8_8_8_8_GAMMA resolves decode
+    // PWL gamma to linear before MSAA averaging / conversion, then write gamma
+    // bytes again for gamma dests. Kept as a constant in the resolve shader.
+    uint32_t decode_pwl_gamma : 1;
   };
   ResolveEdramInfo() : packed(0) { static_assert_size(*this, sizeof(packed)); }
 };
@@ -549,7 +553,7 @@ union ResolveCoordinateInfo {
     // May be zero if the original rectangle was somehow specified in a
     // totally broken way - in this case, the resolve must be dropped.
     uint32_t width_div_8 : xenos::kResolveSizeBits -
-        xenos::kResolveAlignmentPixelsLog2;
+                           xenos::kResolveAlignmentPixelsLog2;
 
     // 1 to 7.
     uint32_t draw_resolution_scale_x : 3;
@@ -572,9 +576,9 @@ union ResolveCopyDestCoordinateInfo {
   struct {
     // 0...16384/32.
     uint32_t pitch_aligned_div_32 : xenos::kTexture2DCubeMaxWidthHeightLog2 +
-        2 - xenos::kTextureTileWidthHeightLog2;
+                                    2 - xenos::kTextureTileWidthHeightLog2;
     uint32_t height_aligned_div_32 : xenos::kTexture2DCubeMaxWidthHeightLog2 +
-        2 - xenos::kTextureTileWidthHeightLog2;
+                                     2 - xenos::kTextureTileWidthHeightLog2;
 
     // Up to the maximum period of the texture tiled address function (128x128
     // for 2D 1bpb).
@@ -726,9 +730,19 @@ struct ResolveInfo {
     // Not doing -32...32 to -1...1 clamping here as a hack for k_16_16 and
     // k_16_16_16_16 blending emulation when using host render targets as it
     // would be inconsistent with the usual way of clearing with a depth quad.
-    // TODO(Triang3l): Check which 32-bit portion is in which register.
-    constants_out.rt_specific.clear_value[0] = rb_color_clear;
-    constants_out.rt_specific.clear_value[1] = rb_color_clear_lo;
+    if (color_edram_info.format_is_64bpp) {
+      // RB_COLOR_CLEAR_LO holds the lower 32 bits.
+      // Red | green << 16 for 16_16_16_16, red for 32_32_FLOAT.
+      // RB_COLOR_CLEAR holds the upper 32 bits.
+      // D3D builds the low dword as R | G << 16 and the high as B | A << 16,
+      // and writes to the _LO and base register respectively.
+      constants_out.rt_specific.clear_value[0] = rb_color_clear_lo;
+      constants_out.rt_specific.clear_value[1] = rb_color_clear;
+    } else {
+      // 32bpp clear values are only taken from RB_COLOR_CLEAR.
+      constants_out.rt_specific.clear_value[0] = rb_color_clear;
+      constants_out.rt_specific.clear_value[1] = rb_color_clear;
+    }
     constants_out.rt_specific.edram_info = color_edram_info;
     constants_out.coordinate_info = coordinate_info;
   }
@@ -767,105 +781,12 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
                     bool fixed_rgba16_truncated_to_minus_1_to_1,
                     ResolveInfo& info_out);
 
-// Maximum length for debug marker labels.
-static constexpr size_t kDebugMarkerLabelMaxLength = 256;
-
-// Returns the MSAA sample count as a string for debug markers.
-inline const char* GetMsaaSamplesString(xenos::MsaaSamples msaa_samples) {
-  switch (msaa_samples) {
-    case xenos::MsaaSamples::k2X:
-      return "2x";
-    case xenos::MsaaSamples::k4X:
-      return "4x";
-    default:
-      return "1x";
-  }
-}
-
-// Formats a debug marker string for resolve copy operations (EDRAM reads).
-// Used by D3D12 and Vulkan backends.
-inline void FormatResolveCopyDebugMarker(char* buffer, size_t buffer_size,
-                                         const ResolveInfo& resolve_info) {
-  ResolveEdramInfo edram_info = resolve_info.IsCopyingDepth()
-                                    ? resolve_info.depth_edram_info
-                                    : resolve_info.color_edram_info;
-  std::snprintf(buffer, buffer_size,
-                "EDRAM Read: Resolve %s %s to 0x%08X, %u bytes, %ux%u",
-                edram_info.is_depth ? "depth" : "color",
-                GetMsaaSamplesString(edram_info.msaa_samples),
-                resolve_info.copy_dest_extent_start,
-                resolve_info.copy_dest_extent_length,
-                resolve_info.coordinate_info.width_div_8 * 8,
-                resolve_info.height_div_8 * 8);
-}
-
-// Formats a debug marker string for resolve clear operations (EDRAM writes).
-// Used by D3D12 and Vulkan backends.
-inline void FormatResolveClearDebugMarker(char* buffer, size_t buffer_size,
-                                          const ResolveInfo& resolve_info,
-                                          bool clear_depth, bool clear_color) {
-  if (clear_depth && clear_color) {
-    std::snprintf(buffer, buffer_size,
-                  "EDRAM Write: Resolve Clear depth=0x%08X color=0x%08X",
-                  resolve_info.rb_depth_clear, resolve_info.rb_color_clear);
-  } else if (clear_depth) {
-    std::snprintf(buffer, buffer_size,
-                  "EDRAM Write: Resolve Clear depth=0x%08X",
-                  resolve_info.rb_depth_clear);
-  } else {
-    std::snprintf(buffer, buffer_size,
-                  "EDRAM Write: Resolve Clear color=0x%08X",
-                  resolve_info.rb_color_clear);
-  }
-}
-
-// Formats a debug marker string for draw calls. Used by D3D12 and Vulkan
-// backends to create consistent debug annotations for tools like RenderDoc/PIX.
-inline void FormatDrawDebugMarker(
-    char* buffer, size_t buffer_size, xenos::PrimitiveType prim_type,
-    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
-    uint64_t vs_hash, uint64_t ps_hash) {
-  const char* index_info = "auto";
-  if (primitive_processing_result.index_buffer_type ==
-      PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
-    index_info = primitive_processing_result.host_index_format ==
-                         xenos::IndexFormat::kInt32
-                     ? "idx32"
-                     : "idx16";
-  } else if (primitive_processing_result.index_buffer_type !=
-             PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
-    index_info = "idx-conv";
-  }
-
-  if (primitive_processing_result.IsTessellated()) {
-    const char* tess_mode = "unknown";
-    switch (primitive_processing_result.tessellation_mode) {
-      case xenos::TessellationMode::kDiscrete:
-        tess_mode = "discrete";
-        break;
-      case xenos::TessellationMode::kContinuous:
-        tess_mode = "continuous";
-        break;
-      case xenos::TessellationMode::kAdaptive:
-        tess_mode = "adaptive";
-        break;
-    }
-    std::snprintf(buffer, buffer_size,
-                  "IssueDraw: %s verts:%u %s tess:%s vs:%016llX ps:%016llX",
-                  xenos::GetPrimitiveTypeEnglishDescription(prim_type),
-                  primitive_processing_result.host_draw_vertex_count,
-                  index_info, tess_mode,
-                  static_cast<unsigned long long>(vs_hash),
-                  static_cast<unsigned long long>(ps_hash));
-  } else {
-    std::snprintf(buffer, buffer_size,
-                  "IssueDraw: %s verts:%u %s vs:%016llX ps:%016llX",
-                  xenos::GetPrimitiveTypeEnglishDescription(prim_type),
-                  primitive_processing_result.host_draw_vertex_count,
-                  index_info, static_cast<unsigned long long>(vs_hash),
-                  static_cast<unsigned long long>(ps_hash));
-  }
-}
+// Returns log2 of the resolve copy destination texel size in bytes for the
+// destination info previously returned by a render target cache Resolve (with
+// the format already normalized to the actual xenos::TextureFormat) - the same
+// derivation the destination extent was calculated with in GetResolveInfo.
+uint32_t GetResolveDownscalePixelSizeLog2(
+    reg::RB_COPY_DEST_INFO copy_dest_info);
 
 }  // namespace draw_util
 }  // namespace gpu

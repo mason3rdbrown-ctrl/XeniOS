@@ -31,7 +31,6 @@
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
-#include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
@@ -61,32 +60,11 @@ DEFINE_int32(
     "0 to disable multithreaded pipeline creation.",
     "Vulkan");
 
-DECLARE_bool(vulkan_dynamic_rendering);
+DECLARE_bool(spirv_disable_rounding_mode_rte);
 
 namespace xe {
 namespace gpu {
 namespace vulkan {
-
-namespace {
-
-bool IsPrimitiveRestartAlwaysEnabledOnMoltenVK(
-    const ui::vulkan::VulkanDevice::Properties& device_properties,
-    VkPrimitiveTopology topology) {
-  if (device_properties.driverID != VK_DRIVER_ID_MOLTENVK) {
-    return false;
-  }
-
-  switch (topology) {
-    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
-    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
-    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
-      return true;
-    default:
-      return false;
-  }
-}
-
-}  // namespace
 
 VulkanPipelineCache::VulkanPipelineCache(
     VulkanCommandProcessor& command_processor,
@@ -104,16 +82,20 @@ bool VulkanPipelineCache::Initialize() {
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
 
-  // Cache the SPIR-V version for geometry shader creation.
-  spirv_version_ = SpirvShaderTranslator::Features(vulkan_device).spirv_version;
-
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() ==
       RenderTargetCache::Path::kPixelShaderInterlock;
 
+  // Cache device float control features for geometry shader creation.
+  const SpirvShaderTranslator::Features features(vulkan_device);
+  signed_zero_inf_nan_preserve_float32_ =
+      features.signed_zero_inf_nan_preserve_float32;
+  denorm_flush_to_zero_float32_ = features.denorm_flush_to_zero_float32;
+  rounding_mode_rte_float32_ = features.rounding_mode_rte_float32 &&
+                               !cvars::spirv_disable_rounding_mode_rte;
+
   shader_translator_ = std::make_unique<SpirvShaderTranslator>(
-      SpirvShaderTranslator::Features(vulkan_device),
-      render_target_cache_.msaa_2x_attachments_supported(),
+      features, render_target_cache_.msaa_2x_attachments_supported(),
       render_target_cache_.msaa_2x_no_attachments_supported(),
       edram_fragment_shader_interlock,
       render_target_cache_.draw_resolution_scale_x(),
@@ -224,6 +206,13 @@ bool VulkanPipelineCache::Initialize() {
     }
   }
 
+  if (cvars::force_depth_clamp && !vulkan_device->properties().depthClamp) {
+    XELOGW(
+        "force_depth_clamp is enabled, but the device doesn't support depth "
+        "clamping - guest draws with clipping enabled will still be clipped "
+        "to the host planes");
+  }
+
   // Create placeholder pixel shader for pipeline hot-swap (stutter reduction).
   placeholder_pixel_shader_ = ui::vulkan::util::CreateShaderModule(
       vulkan_device, shaders::placeholder_ps, sizeof(shaders::placeholder_ps));
@@ -271,7 +260,6 @@ bool VulkanPipelineCache::Initialize() {
       creation_threads_.push_back(std::move(creation_thread));
     }
   }
-
   return true;
 }
 
@@ -310,6 +298,12 @@ void VulkanPipelineCache::Shutdown() {
   // device should be idle at shutdown).
   {
     std::lock_guard<std::mutex> lock(deferred_destroy_mutex_);
+    for (VkShaderModule module : deferred_destroy_shader_modules_) {
+      if (module != VK_NULL_HANDLE) {
+        dfn.vkDestroyShaderModule(device, module, nullptr);
+      }
+    }
+    deferred_destroy_shader_modules_.clear();
     for (const auto& pipeline_pair : deferred_destroy_pipelines_) {
       if (pipeline_pair.first != VK_NULL_HANDLE) {
         dfn.vkDestroyPipeline(device, pipeline_pair.first, nullptr);
@@ -425,6 +419,12 @@ VulkanPipelineCache::GetCurrentVertexShaderModification(
 
   modification.vertex.interpolator_mask = interpolator_mask;
 
+  // Tessellation mode selects the domain shader spacing.
+  if (Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type)) {
+    modification.vertex.tessellation_mode =
+        regs.Get<reg::VGT_HOS_CNTL>().tess_mode;
+  }
+
   // User clip planes.
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   uint32_t user_clip_planes =
@@ -432,6 +432,13 @@ VulkanPipelineCache::GetCurrentVertexShaderModification(
   modification.vertex.user_clip_plane_count = xe::bit_count(user_clip_planes);
   modification.vertex.user_clip_plane_cull =
       uint32_t(user_clip_planes && pa_cl_clip_cntl.ucp_cull_only_ena);
+
+  // Vertex kill via the kill flag (oPts.z). The "and" operator (kill only when
+  // all vertices of the primitive request it) is emulated with a cull distance;
+  // the "or" operator sets the position to NaN in the translator.
+  modification.vertex.vertex_kill_and =
+      uint32_t((shader.writes_point_size_edge_flag_kill_vertex() & 0b100) &&
+               !pa_cl_clip_cntl.vtx_kill_or);
 
   if (host_vertex_shader_type ==
       Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
@@ -482,6 +489,10 @@ VulkanPipelineCache::GetCurrentPixelShaderModification(
 
   if (render_target_cache_.GetPath() ==
       RenderTargetCache::Path::kHostRenderTargets) {
+    // Whether this draw is native res due to a scale threshold. (FBO only)
+    modification.pixel.resolution_scale_native =
+        uint32_t(render_target_cache_.IsDrawScaleNative());
+
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
@@ -500,9 +511,12 @@ VulkanPipelineCache::GetCurrentPixelShaderModification(
       if (apply_polygon_offset_in_shader) {
         modification.pixel.depth_stencil_mode =
             DepthStencilMode::kPolygonOffset;
+      } else if (shader.implicit_early_z_write_allowed() &&
+                 (!shader.writes_color_target(0) ||
+                  !draw_util::DoesCoverageDependOnAlpha(
+                      regs.Get<reg::RB_COLORCONTROL>()))) {
+        modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
       } else {
-        // kEarlyHint was tried here but it seems to trigger GPU fault on nvidia
-        // (entering gameplay in Alan Wake), so going with the safe alternative.
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
       }
     }
@@ -538,13 +552,6 @@ VulkanPipelineCache::GetCurrentPixelShaderModification(
             xenos::BlendFactor::kSrcAlpha;
       }
     }
-
-    // Extract 1 bit per RT from the 4-bits-per-RT normalized_color_mask.
-    modification.pixel.color_targets_used =
-        (((normalized_color_mask >> 0) & 0xF) ? 1 : 0) |
-        (((normalized_color_mask >> 4) & 0xF) ? 2 : 0) |
-        (((normalized_color_mask >> 8) & 0xF) ? 4 : 0) |
-        (((normalized_color_mask >> 12) & 0xF) ? 8 : 0);
   }
 
   return modification;
@@ -692,15 +699,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
   // Get tessellation shaders if needed.
   VkShaderModule tessellation_vertex_shader = VK_NULL_HANDLE;
   VkShaderModule tessellation_control_shader = VK_NULL_HANDLE;
-  XELOGD("VulkanPipelineCache: ConfigurePipeline tessellation_mode={} patch={}",
-         static_cast<uint32_t>(description.tessellation_mode),
-         static_cast<uint32_t>(description.tessellation_patch));
   if (description.tessellation_mode != PipelineTessellationMode::kNone) {
     tessellation_vertex_shader =
         GetTessellationVertexShader(description.tessellation_mode);
-    // Determine if we should use multi-control-point hull shaders.
-    // For adaptive mode, we always use multi-control-point (per-edge factors).
-    // For discrete/continuous, the host vertex shader type determines this.
     bool use_control_point_count =
         (description.tessellation_mode == PipelineTessellationMode::kAdaptive);
     tessellation_control_shader = GetTessellationControlShader(
@@ -739,7 +740,6 @@ bool VulkanPipelineCache::ConfigurePipeline(
     placeholder_args.tessellation_vertex_shader = tessellation_vertex_shader;
     placeholder_args.tessellation_control_shader = tessellation_control_shader;
     placeholder_args.render_pass = render_pass;
-    placeholder_args.render_pass_key = render_pass_key;
 
     if (EnsurePipelineCreatedWithPlaceholder(placeholder_args)) {
       // Queue real pipeline creation in background.
@@ -766,7 +766,6 @@ bool VulkanPipelineCache::ConfigurePipeline(
         creation_arguments.tessellation_control_shader =
             tessellation_control_shader;
         creation_arguments.render_pass = render_pass;
-        creation_arguments.render_pass_key = render_pass_key;
         creation_arguments.priority = priority;
         creation_queue_.push(creation_arguments);
       }
@@ -791,7 +790,6 @@ bool VulkanPipelineCache::ConfigurePipeline(
     creation_arguments.tessellation_control_shader =
         tessellation_control_shader;
     creation_arguments.render_pass = render_pass;
-    creation_arguments.render_pass_key = render_pass_key;
     if (!EnsurePipelineCreated(creation_arguments)) {
       return false;
     }
@@ -891,10 +889,8 @@ void VulkanPipelineCache::CreationThread() {
     if (!EnsureShadersTranslated(creation_arguments.vertex_shader,
                                  creation_arguments.pixel_shader)) {
       XELOGE("Failed to translate shaders for pipeline creation");
-    } else {
-      if (!EnsurePipelineCreated(creation_arguments)) {
-        XELOGE("Failed to create Vulkan pipeline");
-      }
+    } else if (!EnsurePipelineCreated(creation_arguments)) {
+      XELOGE("Failed to create Vulkan pipeline");
     }
     // On failure: if a placeholder exists it will remain in use permanently.
     // Clear the flag so we're not in a misleading "waiting for real" state.
@@ -936,23 +932,19 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(
     VulkanShader::VulkanTranslation& translation) {
   VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
 
-  // Perform translation (optimization is already disabled in translator
-  // constructor). If this fails the shader will be marked as invalid and
-  // ignored later.
+  // Perform translation.
+  // If this fails the shader will be marked as invalid and ignored later.
   if (!translator.TranslateAnalyzedShader(translation)) {
     XELOGE("Shader {:016X} translation failed; marking as ignored",
            shader.ucode_data_hash());
     return false;
   }
-
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
   }
 
-  // Dump shader files if desired.
-  if (!cvars::dump_shaders.empty()) {
-    translation.Dump(cvars::dump_shaders, "vulkan");
-  }
+  // TODO(Triang3l): Log that the shader has been successfully translated in
+  // common code.
 
   // Set up the texture binding layout.
   if (shader.EnterBindingLayoutUserUIDSetup()) {
@@ -1137,15 +1129,37 @@ void VulkanPipelineCache::WritePipelineRenderTargetDescription(
         /* 15 */ PipelineBlendFactor::kOneMinusConstantAlpha,
         /* 16 */ PipelineBlendFactor::kSrcAlphaSaturate,
     };
+    // Like kBlendFactorMap, but with the color factors changed to their alpha
+    // equivalents. Alpha is scalar, so hardware treats a _COLOR factor in the
+    // alpha slot as the matching _ALPHA factor.
+    static constexpr PipelineBlendFactor kBlendFactorAlphaMap[32] = {
+        /*  0 */ PipelineBlendFactor::kZero,
+        /*  1 */ PipelineBlendFactor::kOne,
+        /*  2 */ PipelineBlendFactor::kZero,  // ?
+        /*  3 */ PipelineBlendFactor::kZero,  // ?
+        /*  4 */ PipelineBlendFactor::kSrcAlpha,
+        /*  5 */ PipelineBlendFactor::kOneMinusSrcAlpha,
+        /*  6 */ PipelineBlendFactor::kSrcAlpha,
+        /*  7 */ PipelineBlendFactor::kOneMinusSrcAlpha,
+        /*  8 */ PipelineBlendFactor::kDstAlpha,
+        /*  9 */ PipelineBlendFactor::kOneMinusDstAlpha,
+        /* 10 */ PipelineBlendFactor::kDstAlpha,
+        /* 11 */ PipelineBlendFactor::kOneMinusDstAlpha,
+        /* 12 */ PipelineBlendFactor::kConstantAlpha,
+        /* 13 */ PipelineBlendFactor::kOneMinusConstantAlpha,
+        /* 14 */ PipelineBlendFactor::kConstantAlpha,
+        /* 15 */ PipelineBlendFactor::kOneMinusConstantAlpha,
+        /* 16 */ PipelineBlendFactor::kSrcAlphaSaturate,
+    };
     render_target_out.src_color_blend_factor =
         kBlendFactorMap[uint32_t(blend_control.color_srcblend)];
     render_target_out.dst_color_blend_factor =
         kBlendFactorMap[uint32_t(blend_control.color_destblend)];
     render_target_out.color_blend_op = blend_control.color_comb_fcn;
     render_target_out.src_alpha_blend_factor =
-        kBlendFactorMap[uint32_t(blend_control.alpha_srcblend)];
+        kBlendFactorAlphaMap[uint32_t(blend_control.alpha_srcblend)];
     render_target_out.dst_alpha_blend_factor =
-        kBlendFactorMap[uint32_t(blend_control.alpha_destblend)];
+        kBlendFactorAlphaMap[uint32_t(blend_control.alpha_destblend)];
     render_target_out.alpha_blend_op = blend_control.alpha_comb_fcn;
     if (!command_processor_.GetVulkanDevice()
              ->properties()
@@ -1298,9 +1312,16 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   description_out.primitive_restart =
       primitive_processing_result.host_primitive_reset_enabled;
 
+  // With force_depth_clamp, use the host viewport clamp instead of near and far
+  // Z plane clipping. X/Y/W clipping is unchanged. Both 494707EE and 41560881
+  // have passes that rely on alpha inputs that currently gets dropped by
+  // near-plane clipping.
+  // TODO(boma): Investigate whether the difference is in shader arithmetic or
+  // the clipper itself.
   description_out.depth_clamp_enable =
       device_properties.depthClamp &&
-      regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+      (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ||
+       cvars::force_depth_clamp);
 
   // TODO(Triang3l): Tessellation.
   bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
@@ -1507,12 +1528,9 @@ bool VulkanPipelineCache::GetGeometryShaderKey(
   }
   GeometryShaderKey key;
   key.type = geometry_shader_type;
-  // TODO(Triang3l): Once all needed inputs and outputs are added, uncomment the
-  // real counts here.
   key.interpolator_count =
       xe::bit_count(vertex_shader_modification.vertex.interpolator_mask);
-  key.has_vertex_kill_and =
-      /* vertex_shader_modification.vertex.vertex_kill_and */ 0;
+  key.has_vertex_kill_and = vertex_shader_modification.vertex.vertex_kill_and;
   key.has_point_size =
       vertex_shader_modification.vertex.output_point_parameters;
   key.has_point_coordinates = pixel_shader_modification.pixel.param_gen_point;
@@ -1578,7 +1596,7 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
   }
   cull_distance_count += key.has_vertex_kill_and;
 
-  SpirvBuilder builder(spirv_version_,
+  SpirvBuilder builder(spv::Spv_1_0,
                        (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1,
                        nullptr);
   spv::Id ext_inst_glsl_std_450 = builder.import("GLSL.std.450");
@@ -1592,7 +1610,25 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
   builder.setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
   builder.setSource(spv::SourceLanguageUnknown, 0);
 
-  // TODO(Triang3l): Shader float controls (NaN preservation most importantly).
+  // Match the vertex and pixel shaders' float controls. NaN preservation most
+  // importantly keeps the NaN-position primitive discard below (used for the
+  // vertex kill "or" operator and degenerate rectangles) from being folded
+  // away. The geometry shader is built as SPIR-V 1.0, where the float controls
+  // are an extension. The execution modes are added once the entry point
+  // exists.
+  if (denorm_flush_to_zero_float32_ || signed_zero_inf_nan_preserve_float32_ ||
+      rounding_mode_rte_float32_) {
+    builder.addExtension("SPV_KHR_float_controls");
+  }
+  if (denorm_flush_to_zero_float32_) {
+    builder.addCapability(spv::CapabilityDenormFlushToZero);
+  }
+  if (signed_zero_inf_nan_preserve_float32_) {
+    builder.addCapability(spv::CapabilitySignedZeroInfNanPreserve);
+  }
+  if (rounding_mode_rte_float32_) {
+    builder.addCapability(spv::CapabilityRoundingModeRTE);
+  }
 
   std::vector<spv::Id> main_interface;
 
@@ -1839,6 +1875,18 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
   builder.addExecutionMode(main_function, output_primitive_execution_mode);
   builder.addExecutionMode(main_function, spv::ExecutionModeOutputVertices,
                            int(output_max_vertices));
+  if (denorm_flush_to_zero_float32_) {
+    builder.addExecutionMode(main_function, spv::ExecutionModeDenormFlushToZero,
+                             32);
+  }
+  if (signed_zero_inf_nan_preserve_float32_) {
+    builder.addExecutionMode(main_function,
+                             spv::ExecutionModeSignedZeroInfNanPreserve, 32);
+  }
+  if (rounding_mode_rte_float32_) {
+    builder.addExecutionMode(main_function, spv::ExecutionModeRoundingModeRTE,
+                             32);
+  }
 
   // Note that after every OpEmitVertex, all output variables are undefined.
 
@@ -2794,15 +2842,8 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       assert_unhandled_case(description.primitive_topology);
       return false;
   }
-  // MoltenVK lowers strip/fan primitive restart to Metal, where it can't be
-  // disabled for these topologies. Request the behavior Metal will use anyway
-  // so MoltenVK doesn't warn on every affected pipeline.
   input_assembly_state.primitiveRestartEnable =
-      description.primitive_restart ||
-              IsPrimitiveRestartAlwaysEnabledOnMoltenVK(
-                  vulkan_device->properties(), input_assembly_state.topology)
-          ? VK_TRUE
-          : VK_FALSE;
+      description.primitive_restart ? VK_TRUE : VK_FALSE;
 
   VkPipelineViewportStateCreateInfo viewport_state;
   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -3059,48 +3100,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     }
   }
 
-  // Dynamic rendering support (VK_KHR_dynamic_rendering / Vulkan 1.3).
-  VkPipelineRenderingCreateInfo pipeline_rendering_create_info = {};
-  VkFormat color_attachment_formats[xenos::kMaxColorRenderTargets] = {};
-  bool use_dynamic_rendering = cvars::vulkan_dynamic_rendering &&
-                               vulkan_device->properties().dynamicRendering;
-
-  if (use_dynamic_rendering) {
-    pipeline_rendering_create_info.sType =
-        VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    VulkanRenderTargetCache::RenderPassKey key =
-        creation_arguments.render_pass_key;
-
-    // Set up color attachment formats.
-    xenos::ColorRenderTargetFormat color_formats[] = {
-        key.color_0_view_format, key.color_1_view_format,
-        key.color_2_view_format, key.color_3_view_format};
-    uint32_t color_attachment_count = 0;
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      if (key.depth_and_color_used & (1 << (1 + i))) {
-        color_attachment_formats[i] =
-            render_target_cache_.GetColorVulkanFormat(color_formats[i]);
-        color_attachment_count = i + 1;
-      }
-    }
-    pipeline_rendering_create_info.colorAttachmentCount =
-        color_attachment_count;
-    pipeline_rendering_create_info.pColorAttachmentFormats =
-        color_attachment_formats;
-
-    // Set up depth/stencil format.
-    if (key.depth_and_color_used & 0b1) {
-      VkFormat depth_format =
-          render_target_cache_.GetDepthVulkanFormat(key.depth_format);
-      pipeline_rendering_create_info.depthAttachmentFormat = depth_format;
-      pipeline_rendering_create_info.stencilAttachmentFormat = depth_format;
-    }
-  }
-
   VkGraphicsPipelineCreateInfo pipeline_create_info;
   pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-  pipeline_create_info.pNext =
-      use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
+  pipeline_create_info.pNext = nullptr;
   pipeline_create_info.flags = 0;
   pipeline_create_info.stageCount = shader_stage_count;
   pipeline_create_info.pStages = shader_stages.data();
@@ -3116,8 +3118,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   pipeline_create_info.pDynamicState = &dynamic_state;
   pipeline_create_info.layout =
       creation_arguments.pipeline->second.pipeline_layout->GetPipelineLayout();
-  pipeline_create_info.renderPass =
-      use_dynamic_rendering ? VK_NULL_HANDLE : creation_arguments.render_pass;
+  pipeline_create_info.renderPass = creation_arguments.render_pass;
   pipeline_create_info.subpass = 0;
   pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
   pipeline_create_info.basePipelineIndex = -1;
@@ -3172,15 +3173,19 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
 }
 
 void VulkanPipelineCache::ProcessDeferredDestructions() {
+  std::vector<VkShaderModule> modules_to_destroy;
   std::vector<VkPipeline> pipelines_to_destroy;
 
   uint64_t completed_submission = command_processor_.GetCompletedSubmission();
 
   {
     std::lock_guard<std::mutex> lock(deferred_destroy_mutex_);
-    if (deferred_destroy_pipelines_.empty()) {
+    if (deferred_destroy_shader_modules_.empty() &&
+        deferred_destroy_pipelines_.empty()) {
       return;
     }
+    modules_to_destroy = std::move(deferred_destroy_shader_modules_);
+    deferred_destroy_shader_modules_.clear();
 
     // Only destroy pipelines whose submission has completed on the GPU.
     // Keep pipelines that are still potentially in-flight.
@@ -3196,15 +3201,17 @@ void VulkanPipelineCache::ProcessDeferredDestructions() {
     }
   }
 
-  if (pipelines_to_destroy.empty()) {
-    return;
-  }
-
-  // Destroy pipelines now that we know GPU is done with them.
+  // Destroy the modules and pipelines now that we know GPU is done with them.
   const ui::vulkan::VulkanDevice* vulkan_device =
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   VkDevice device = vulkan_device->device();
+
+  for (VkShaderModule module : modules_to_destroy) {
+    if (module != VK_NULL_HANDLE) {
+      dfn.vkDestroyShaderModule(device, module, nullptr);
+    }
+  }
 
   for (VkPipeline pipeline : pipelines_to_destroy) {
     if (pipeline != VK_NULL_HANDLE) {
@@ -3502,8 +3509,6 @@ void VulkanPipelineCache::InitializeShaderStorage(
         creation_arguments.tessellation_control_shader =
             tessellation_control_shader;
         creation_arguments.render_pass = render_pass;
-        creation_arguments.render_pass_key =
-            pipeline_description.render_pass_key;
         creation_arguments.priority = priority;
         creation_queue_.push(creation_arguments);
         creation_request_cond_.notify_one();
@@ -3519,8 +3524,6 @@ void VulkanPipelineCache::InitializeShaderStorage(
         creation_arguments.tessellation_control_shader =
             tessellation_control_shader;
         creation_arguments.render_pass = render_pass;
-        creation_arguments.render_pass_key =
-            pipeline_description.render_pass_key;
         EnsurePipelineCreated(creation_arguments);
       }
 

@@ -9,7 +9,6 @@
 
 #include "xenia/ui/vulkan/vulkan_instance.h"
 
-#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -21,22 +20,10 @@
 #include "xenia/base/platform.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
-#if XE_PLATFORM_LINUX || XE_PLATFORM_APPLE
+#if XE_PLATFORM_LINUX
 #include <dlfcn.h>
 #elif XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
-#endif
-
-#if XE_PLATFORM_APPLE
-// MoltenVK is statically linked; declare the two entry points we resolve at
-// load time (vulkan_api.h sets VK_NO_PROTOTYPES, so the prototypes from
-// vulkan.h aren't visible).
-extern "C" {
-VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-vkGetInstanceProcAddr(VkInstance instance, const char* pName);
-VKAPI_ATTR void VKAPI_CALL
-vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator);
-}
 #endif
 
 DEFINE_bool(
@@ -50,7 +37,7 @@ namespace ui {
 namespace vulkan {
 
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(
-    const bool with_surface, const int validation_level) {
+    const bool with_surface, const bool try_enable_validation) {
   std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
 
   // Load the RenderDoc API if connected.
@@ -78,9 +65,6 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
   functions_loaded &=                                                    \
       (ifn.name = PFN_##name(dlsym(vulkan_instance->loader_, #name))) != \
       nullptr;
-#elif XE_PLATFORM_APPLE
-  // MoltenVK is statically linked; the vk* entry points are real symbols.
-#define XE_VULKAN_LOAD_LOADER_FUNCTION(name) ifn.name = &::name;
 #elif XE_PLATFORM_WIN32
   vulkan_instance->loader_ = LoadLibraryW(L"vulkan-1.dll");
   if (!vulkan_instance->loader_) {
@@ -162,23 +146,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
         "VK_KHR_xcb_surface",
         &vulkan_instance->extensions_.ext_KHR_xcb_surface);
 #endif
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
-    // #7.
-    requested_extensions.emplace(
-        "VK_KHR_wayland_surface",
-        &vulkan_instance->extensions_.ext_KHR_wayland_surface);
-#endif
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
     // #9.
     requested_extensions.emplace(
         "VK_KHR_android_surface",
         &vulkan_instance->extensions_.ext_KHR_android_surface);
-#endif
-#ifdef VK_USE_PLATFORM_METAL_EXT
-    // #218.
-    requested_extensions.emplace(
-        "VK_EXT_metal_surface",
-        &vulkan_instance->extensions_.ext_EXT_metal_surface);
 #endif
 #ifdef VK_USE_PLATFORM_WIN32_KHR
     // #10.
@@ -245,16 +217,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
   // vector.
   std::unordered_map<std::string, bool*> requested_layers;
   bool layer_khronos_validation = false;
-  // VK_EXT_validation_features (#248) is provided by the validation layer;
-  // request it alongside so we can chain VkValidationFeaturesEXT.
-  bool ext_EXT_validation_features = false;
-  if (validation_level >= 1) {
+  if (try_enable_validation) {
     requested_layers.emplace("VK_LAYER_KHRONOS_validation",
                              &layer_khronos_validation);
-    if (validation_level >= 2) {
-      requested_extensions.emplace("VK_EXT_validation_features",
-                                   &ext_EXT_validation_features);
-    }
   }
 
   std::vector<const char*> enabled_layers;
@@ -403,33 +368,6 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
   instance_create_info.enabledExtensionCount =
       uint32_t(enabled_extensions.size());
   instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
-
-  // Opt into extra validation features when the corresponding level is set and
-  // VK_EXT_validation_features was provided by the validation layer.
-  VkValidationFeatureEnableEXT validation_feature_enables[3];
-  VkValidationFeaturesEXT validation_features = {
-      VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
-  if (ext_EXT_validation_features) {
-    uint32_t enable_count = 0;
-    if (validation_level >= 2) {
-      validation_feature_enables[enable_count++] =
-          VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
-    }
-    if (validation_level >= 3) {
-      validation_feature_enables[enable_count++] =
-          VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT;
-      validation_feature_enables[enable_count++] =
-          VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT;
-    }
-    if (enable_count) {
-      validation_features.enabledValidationFeatureCount = enable_count;
-      validation_features.pEnabledValidationFeatures =
-          validation_feature_enables;
-      validation_features.pNext = instance_create_info.pNext;
-      instance_create_info.pNext = &validation_features;
-    }
-  }
-
   VkResult instance_create_result = ifn.vkCreateInstance(
       &instance_create_info, nullptr, &vulkan_instance->instance_);
 
@@ -447,11 +385,6 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
     instance_create_info.enabledLayerCount = 0;
     instance_create_info.enabledExtensionCount =
         uint32_t(enabled_implementation_extension_count);
-    // VkValidationFeaturesEXT comes from the validation layer; if we're
-    // retrying without it, unchain the struct.
-    if (instance_create_info.pNext == &validation_features) {
-      instance_create_info.pNext = validation_features.pNext;
-    }
     instance_create_result = ifn.vkCreateInstance(
         &instance_create_info, nullptr, &vulkan_instance->instance_);
   }
@@ -498,19 +431,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
 #include "xenia/ui/vulkan/functions/instance_khr_xcb_surface.inc"
   }
 #endif
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
-  if (vulkan_instance->extensions_.ext_KHR_wayland_surface) {
-#include "xenia/ui/vulkan/functions/instance_khr_wayland_surface.inc"
-  }
-#endif
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
   if (vulkan_instance->extensions_.ext_KHR_android_surface) {
 #include "xenia/ui/vulkan/functions/instance_khr_android_surface.inc"
-  }
-#endif
-#ifdef VK_USE_PLATFORM_METAL_EXT
-  if (vulkan_instance->extensions_.ext_EXT_metal_surface) {
-#include "xenia/ui/vulkan/functions/instance_ext_metal_surface.inc"
   }
 #endif
 #ifdef VK_USE_PLATFORM_WIN32_KHR
@@ -617,7 +540,7 @@ VulkanInstance::~VulkanInstance() {
     functions_.vkDestroyInstance(instance_, nullptr);
   }
 
-#if XE_PLATFORM_LINUX || XE_PLATFORM_APPLE
+#if XE_PLATFORM_LINUX
   if (loader_) {
     dlclose(loader_);
   }

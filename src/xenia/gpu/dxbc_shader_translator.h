@@ -10,7 +10,6 @@
 #ifndef XENIA_GPU_DXBC_SHADER_TRANSLATOR_H_
 #define XENIA_GPU_DXBC_SHADER_TRANSLATOR_H_
 
-#include <array>
 #include <cstddef>
 #include <cstring>
 #include <string>
@@ -115,7 +114,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260526;
+    static constexpr uint32_t kVersion = 0x20260819;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -193,6 +192,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // Only RT0 is supported for now.
       xenos::BlendFactor rt0_blend_rgb_factor_for_premult : 5;
       xenos::BlendFactor rt0_blend_a_factor_for_premult : 5;
+      // PsParamGen and the memexport dedup must act like there's no resolution
+      // scaling. Doesn't affect fetch offsets, those follow texture scale, not
+      // from the draw. This is only set when the draw is native because of a
+      // set scale threshold (RTV only).
+      uint32_t resolution_scale_native : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0)
@@ -409,6 +413,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
 
+    // Integer num_format on fixed textures. Each dword packs the scale needed
+    // to turn normalized host samples back into guest integer values.
+    // bits 0:3 = component_bits - 1
+    // bit 4 = signed
+    // bit 5 = unsigned-biased
+    // bit 24 = normalized
+    // Zero means no scale.
+    uint32_t texture_integer_scale_bits[32];
+
    private:
     friend class DxbcShaderTranslator;
 
@@ -461,6 +474,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kEdramRTBlendFactorsOps,
 
       kEdramBlendConstant,
+
+      kTextureIntegerScaleBits,
 
       kCount,
     };
@@ -578,7 +593,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t f32_temp, uint32_t f32_temp_component, uint32_t temp_temp,
       uint32_t temp_temp_component, bool round_to_nearest_even,
       bool remap_from_0_to_0_5);
-  // Converts the 20e4 number in bits [f24_shift, f24_shift + 10) to a 32-bit
+  // Converts the 20e4 number in bits [f24_shift, f24_shift + 24) to a 32-bit
   // float. Two temporaries must be different, but one can be the same as the
   // source. The destination may be anything writable. If remap_to_0_to_0_5 is
   // true, 0...1 in float24 will be remaped to 0...0.5 in float32.
@@ -802,6 +817,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Adds the surviving coverage MSAA counts from ROV params to the active ZPD
   // counter slot after the final PS depth/stencil decision.
   void ROV_AddPassedMSAASamplesToZPD();
+  // Converts the float32 components of the register to extended-range float16
+  // in their low 16 bits. Exponent 31 holds finite values up to 131008 of
+  // either sign on the Xbox 360 instead of Inf or NaN, and NaN maps to 0.
+  // Pushes and pops its own temporary registers.
+  void Float32ToF16ExtendedRange(uint32_t reg, uint32_t components);
+  // Converts extended-range float16 in the low 16 bits of the components of
+  // the register, with zeros above, back to float32. Pushes and pops its own
+  // temporary registers.
+  void Float16ExtendedRangeTo32(uint32_t reg, uint32_t components);
   // Unpacks a 32bpp or a 64bpp color in packed_temp.packed_temp_components to
   // color_temp, using 2 temporary VGPRs.
   void ROV_UnpackColor(uint32_t rt_index, uint32_t packed_temp,
@@ -952,41 +976,17 @@ class DxbcShaderTranslator : public ShaderTranslator {
     if (cbuffer_index_fetch_constants_ == kBindingIndexUnallocated) {
       cbuffer_index_fetch_constants_ = cbuffer_count_++;
     }
-    MarkTextureFetchConstantDwordUsed(fetch_constant_index * 6 +
-                                      pair_index * 2);
-    MarkTextureFetchConstantDwordUsed(fetch_constant_index * 6 +
-                                      pair_index * 2 + 1);
-    return GetTextureFetchConstantWordPairSource(fetch_constant_index,
-                                                 pair_index);
-  }
-  dxbc::Src RequestTextureFetchConstantWord(uint32_t fetch_constant_index,
-                                            uint32_t word_index) {
-    if (cbuffer_index_fetch_constants_ == kBindingIndexUnallocated) {
-      cbuffer_index_fetch_constants_ = cbuffer_count_++;
-    }
-    MarkTextureFetchConstantDwordUsed(fetch_constant_index * 6 + word_index);
-    return GetTextureFetchConstantWordPairSource(fetch_constant_index,
-                                                 word_index >> 1)
-        .SelectFromSwizzled(word_index & 1);
-  }
-
-  dxbc::Src GetTextureFetchConstantWordPairSource(uint32_t fetch_constant_index,
-                                                  uint32_t pair_index) const {
     uint32_t total_pair_index = fetch_constant_index * 3 + pair_index;
     return dxbc::Src::CB(cbuffer_index_fetch_constants_,
                          uint32_t(CbufferRegister::kFetchConstants),
                          total_pair_index >> 1,
                          (total_pair_index & 1) ? 0b10101110 : 0b00000100);
   }
-  void MarkTextureFetchConstantDwordUsed(uint32_t dword_index) {
-    constexpr uint32_t kFetchConstantDwordCount =
-        xenos::kTextureFetchConstantCount * 6;
-    if (dword_index >= kFetchConstantDwordCount) {
-      assert_always();
-      return;
-    }
-    texture_fetch_constant_dword_mask_[dword_index >> 5] |=
-        uint32_t(1) << (dword_index & 31);
+  dxbc::Src RequestTextureFetchConstantWord(uint32_t fetch_constant_index,
+                                            uint32_t word_index) {
+    return RequestTextureFetchConstantWordPair(fetch_constant_index,
+                                               word_index >> 1)
+        .SelectFromSwizzled(word_index & 1);
   }
 
   void KillPixel(bool condition, const dxbc::Src& condition_src,
@@ -1054,6 +1054,21 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
 
+  // Scale of the draw being translated. All position-dependent paths use
+  // these. Only fetch offset scaling uses draw_resolution_scale_x_/y_ directly.
+  uint32_t GetCurrentDrawResolutionScaleX() const {
+    return is_pixel_shader() &&
+                   GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_x_;
+  }
+  uint32_t GetCurrentDrawResolutionScaleY() const {
+    return is_pixel_shader() &&
+                   GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_y_;
+  }
+
   // Is currently writing the empty depth-only pixel shader, for
   // CompleteTranslation.
   bool is_depth_only_pixel_shader_ = false;
@@ -1109,8 +1124,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t cbuffer_index_bool_loop_constants_;
   uint32_t cbuffer_index_fetch_constants_;
   uint32_t cbuffer_index_descriptor_indices_;
-  std::array<uint32_t, xenos::kTextureFetchConstantCount * 6 / 32>
-      texture_fetch_constant_dword_mask_;
 
   struct SystemConstantRdef {
     const char* name;

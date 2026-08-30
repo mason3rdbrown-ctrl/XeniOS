@@ -186,11 +186,11 @@ bool Processor::AddModule(std::unique_ptr<Module> module) {
 void Processor::RemoveModule(const std::string_view name) {
   auto global_lock = global_critical_region_.Acquire();
 
-  auto itr =
-      std::find_if(modules_.cbegin(), modules_.cend(),
-                   [name](std::unique_ptr<xe::cpu::Module> const& module) {
-                     return module->name() == name;
-                   });
+  auto itr = std::ranges::find_if(
+      std::as_const(modules_),
+      [name](std::unique_ptr<xe::cpu::Module> const& module) {
+        return module->name() == name;
+      });
 
   if (itr != modules_.cend()) {
     const std::vector<uint32_t> addressed_functions =
@@ -267,12 +267,12 @@ Function* Processor::ResolveFunction(uint32_t address) {
     auto function = LookupFunction(address);
 
     if (!function) {
-      entry->status = Entry::STATUS_FAILED;
+      entry_table_.MarkFailed(entry);
       return nullptr;
     }
 
     if (!DemandFunction(function)) {
-      entry->status = Entry::STATUS_FAILED;
+      entry_table_.MarkFailed(entry);
       return nullptr;
     }
     // only add it to the list of resolved functions if resolving succeeded
@@ -286,9 +286,8 @@ Function* Processor::ResolveFunction(uint32_t address) {
       }
     }
 
-    entry->function = function;
-    entry->end_address = function->end_address();
-    status = entry->status = Entry::STATUS_READY;
+    entry_table_.MarkReady(entry, function, function->end_address());
+    status = Entry::STATUS_READY;
   }
   if (status == Entry::STATUS_READY) {
     // Ready to use.
@@ -501,10 +500,7 @@ void Processor::OnThreadCreated(uint32_t thread_handle,
 void Processor::OnThreadExit(uint32_t thread_id) {
   auto global_lock = global_critical_region_.Acquire();
   auto it = thread_debug_infos_.find(thread_id);
-  if (it == thread_debug_infos_.end()) {
-    XELOGW("Processor::OnThreadExit ignored unknown thread {:08X}", thread_id);
-    return;
-  }
+  assert_true(it != thread_debug_infos_.end());
   auto thread_info = it->second.get();
   thread_info->state = ThreadDebugInfo::State::kExited;
 }
@@ -512,11 +508,7 @@ void Processor::OnThreadExit(uint32_t thread_id) {
 void Processor::OnThreadDestroyed(uint32_t thread_id) {
   auto global_lock = global_critical_region_.Acquire();
   auto it = thread_debug_infos_.find(thread_id);
-  if (it == thread_debug_infos_.end()) {
-    XELOGW("Processor::OnThreadDestroyed ignored unknown thread {:08X}",
-           thread_id);
-    return;
-  }
+  assert_true(it != thread_debug_infos_.end());
   it->second->thread_handle = 0;
   thread_debug_infos_.erase(it);
 }
@@ -577,7 +569,7 @@ void Processor::RemoveBreakpoint(Breakpoint* breakpoint) {
   }
 
   // Remove from breakpoint map.
-  auto it = std::find(breakpoints_.begin(), breakpoints_.end(), breakpoint);
+  auto it = std::ranges::find(breakpoints_, breakpoint);
   breakpoints_.erase(it);
 }
 
@@ -659,8 +651,7 @@ bool Processor::OnThreadBreakpointHit(Exception* ex) {
       if ((scan_breakpoint->address_type() == Breakpoint::AddressType::kGuest &&
            scan_breakpoint->guest_address() == frame.guest_pc) ||
           (scan_breakpoint->address_type() == Breakpoint::AddressType::kHost &&
-           scan_breakpoint->host_address() == frame.host_pc) ||
-          scan_breakpoint->ContainsHostAddress(frame.host_pc)) {
+           scan_breakpoint->host_address() == frame.host_pc)) {
         breakpoint = scan_breakpoint;
         break;
       }
@@ -685,14 +676,15 @@ bool Processor::OnThreadBreakpointHit(Exception* ex) {
     debug_listener_->OnExecutionPaused();
   }
 
+  ResumeAllThreads();
   thread_info->thread->thread()->Suspend();
 
   // Apply thread context changes.
   // TODO(benvanik): apply to all threads?
 #if XE_ARCH_AMD64
-  ex->set_resume_pc(thread_info->host_context.rip);
+  ex->set_resume_pc(thread_info->host_context.rip + 2);
 #elif XE_ARCH_ARM64
-  ex->set_resume_pc(thread_info->host_context.pc);
+  ex->set_resume_pc(thread_info->host_context.pc + 2);
 #else
 #error Instruction pointer not specified for the target CPU architecture.
 #endif  // XE_ARCH
@@ -704,10 +696,6 @@ bool Processor::OnThreadBreakpointHit(Exception* ex) {
 void Processor::OnStepCompleted(ThreadDebugInfo* thread_info) {
   auto global_lock = global_critical_region_.Acquire();
   execution_state_ = ExecutionState::kPaused;
-
-  // Unlock before notifying to avoid deadlock with debugger stub.
-  global_lock.unlock();
-
   if (debug_listener_) {
     debug_listener_->OnExecutionPaused();
   }
@@ -719,12 +707,6 @@ bool Processor::OnUnhandledException(Exception* ex) {
   // If we have no listener return right away.
   // TODO(benvanik): DemandDebugListener()?
   if (!debug_listener_) {
-    return false;
-  }
-
-  // Only pause on exceptions when debugging is explicitly enabled.
-  // Without --debug flag, let the exception propagate normally.
-  if (!cvars::debug) {
     return false;
   }
 
@@ -742,19 +724,15 @@ bool Processor::OnUnhandledException(Exception* ex) {
                               ex->thread_context());
 
   // Stop and notify the listener.
-  if (execution_state_ != ExecutionState::kRunning) {
-    global_lock.unlock();
-    Thread::GetCurrentThread()->thread()->Suspend();
-    return true;
-  }
+  // This will take control.
+  assert_true(execution_state_ == ExecutionState::kRunning);
   execution_state_ = ExecutionState::kPaused;
 
-  // Notify debugger that execution stopped.
-  debug_listener_->OnUnhandledException(ex);
+  // Notify debugger that exceution stopped.
+  // debug_listener_->OnException(info);
   debug_listener_->OnExecutionPaused();
 
-  // Unlock before suspending to avoid deadlock with debugger stub.
-  global_lock.unlock();
+  // Suspend self.
   Thread::GetCurrentThread()->thread()->Suspend();
 
   return true;
@@ -965,10 +943,7 @@ void Processor::StepHostInstruction(uint32_t thread_id) {
                        thread_info->step_breakpoint.reset();
                        OnStepCompleted(thread_info);
                      }));
-
-  // Add to front of breakpoints map, so this should get evaluated first
-  breakpoints_.insert(breakpoints_.begin(), thread_info->step_breakpoint.get());
-
+  AddBreakpoint(thread_info->step_breakpoint.get());
   thread_info->step_breakpoint->Resume();
 
   // ResumeAllBreakpoints();
@@ -1001,10 +976,7 @@ void Processor::StepGuestInstruction(uint32_t thread_id) {
                        thread_info->step_breakpoint.reset();
                        OnStepCompleted(thread_info);
                      }));
-
-  // Add to front of breakpoints map, so this should get evaluated first
-  breakpoints_.insert(breakpoints_.begin(), thread_info->step_breakpoint.get());
-
+  AddBreakpoint(thread_info->step_breakpoint.get());
   thread_info->step_breakpoint->Resume();
 
   // ResumeAllBreakpoints();

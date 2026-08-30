@@ -1082,6 +1082,10 @@ struct VECTOR_SHL_V128
           e.vpmovzxbd(e.ymm2, e.xmm2);
           e.vpmovzxbd(e.ymm3, e.xmm3);
 
+          e.vpbroadcastd(e.ymm4, e.GetXmmConstPtr(XMMXOPByteShiftMask));
+          e.vpand(e.ymm2, e.ymm2, e.ymm4);
+          e.vpand(e.ymm3, e.ymm3, e.ymm4);
+
           e.vpsllvd(e.ymm0, e.ymm0, e.ymm2);
           e.vpsllvd(e.ymm1, e.ymm1, e.ymm3);
           e.vextracti128(e.xmm2, e.ymm0, 1);
@@ -2421,6 +2425,10 @@ struct PERMUTE_I32
       } else {
         src3 = i.src3;
       }
+      if (control == MakePermuteMask(0, 2, 0, 3, 1, 0, 1, 1)) {
+        e.vshufps(i.dest, src2, src3, MakeSwizzleMask(2, 3, 0, 1));
+        return;
+      }
       if (i.dest != src3) {
         e.vpshufd(i.dest, src2, src_control);
         e.vpshufd(e.xmm0, src3, src_control);
@@ -3017,24 +3025,15 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
       if (IsPackOutUnsigned(flags)) {
         if (IsPackOutSaturate(flags)) {
           // unsigned -> unsigned + saturate
-#if XE_PLATFORM_WIN32
-          // Windows x64 ABI: __m128i is passed by implicit pointer
-          if (i.src1.is_constant) {
-            e.lea(e.GetNativeParam(0),
-                  e.StashConstantXmm(0, i.src1.constant()));
-          } else {
-            e.lea(e.GetNativeParam(0), e.StashXmm(0, i.src1));
-          }
-          if (i.src2.is_constant) {
-            e.lea(e.GetNativeParam(1),
-                  e.StashConstantXmm(1, i.src2.constant()));
-          } else {
-            e.lea(e.GetNativeParam(1), e.StashXmm(1, i.src2));
-          }
-#else
-          // Linux/Mac System V ABI: __m128i passed in xmm0/xmm1, return in xmm0
           auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
           auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm4);
+
+#if XE_PLATFORM_WIN32
+          // Windows x64 ABI: __m128i is passed by implicit pointer
+          e.lea(e.GetNativeParam(0), e.StashXmm(0, src1));
+          e.lea(e.GetNativeParam(1), e.StashXmm(1, src2));
+#else
+          // Linux/Mac System V ABI: __m128i passed in xmm0/xmm1, return in xmm0
           e.vmovaps(e.xmm0, src1);
           e.vmovaps(e.xmm1, src2);
 #endif

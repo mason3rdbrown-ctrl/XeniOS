@@ -28,12 +28,12 @@
 #include "xenia/gpu/shader.h"
 #include "xenia/gpu/xenos.h"
 
+DECLARE_bool(debug_msaa_2x_as_4x);
 DECLARE_bool(depth_transfer_not_equal_test);
 DECLARE_bool(depth_float24_round);
 DECLARE_bool(depth_float24_convert_in_pixel_shader);
 DECLARE_bool(draw_resolution_scaled_texture_offsets);
 DECLARE_bool(gamma_render_target_as_unorm16);
-DECLARE_bool(native_2x_msaa);
 DECLARE_bool(native_stencil_value_output);
 DECLARE_bool(snorm16_render_target_full_range);
 
@@ -186,6 +186,23 @@ class RenderTargetCache {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
   }
 
+  // Whether surfaces with this pitch render native per the scale threshold.
+  // Compares the tile-aligned width, so it's a pure function of key fields.
+  bool IsScaleNativeForPitch(uint32_t pitch_tiles_at_32bpp,
+                             xenos::MsaaSamples msaa_samples) const;
+  // Same for RB_SURFACE_INFO
+  bool IsDrawScaleNative() const;
+  // Scale of the current draw, the global scale or 1x1 under the threshold.
+  // Everything per-draw must use these so a draw never mixes scales.
+  // Quietly assuming the global scale all but promises a bunch of mixed-
+  // space artifacts (trust me).
+  uint32_t GetDrawScaleX() const {
+    return IsDrawScaleNative() ? 1 : draw_resolution_scale_x();
+  }
+  uint32_t GetDrawScaleY() const {
+    return IsDrawScaleNative() ? 1 : draw_resolution_scale_y();
+  }
+
   // Virtual (both the common code and the implementation may do something
   // here), don't call from destructors (does work not needed for shutdown
   // also).
@@ -259,6 +276,12 @@ class RenderTargetCache {
       uint32_t is_depth : 1;                                      // 22
       // Ignoring the blending precision.
       uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 26
+      // 1 if this render target is kept at native guest resolution because of
+      // draw_resolution_scale_threshold. Native and scaled targets at the same
+      // base are distinct objects and ownership can be transferred. One bit is
+      // enough. The only classes are the global scale and 1x1. Keys never
+      // carry arbitrary scales.
+      uint32_t scale_native : 1;  // 27
     };
 
     RenderTargetKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -314,11 +337,19 @@ class RenderTargetCache {
     }
 
     std::string GetDebugName() const {
-      return fmt::format("RT @ {}t, <{}t>, {}xMSAA, {}", base_tiles,
+      return fmt::format("RT @ {}t, <{}t>, {}xMSAA, {}{}", base_tiles,
                          GetPitchTiles(), uint32_t(1) << uint32_t(msaa_samples),
-                         GetFormatName());
+                         GetFormatName(), scale_native ? ", native" : "");
     }
   };
+
+  // The scale this render target is actually created and drawn at.
+  uint32_t GetKeyScaleX(RenderTargetKey key) const {
+    return key.scale_native ? 1 : draw_resolution_scale_x();
+  }
+  uint32_t GetKeyScaleY(RenderTargetKey key) const {
+    return key.scale_native ? 1 : draw_resolution_scale_y();
+  }
 
   class RenderTarget {
    public:
@@ -391,11 +422,11 @@ class RenderTargetCache {
     struct {
       // - 1 because the maximum is 0x1FFF / 8, not 0x2000 / 8.
       uint32_t x_pixels_div_8 : xenos::kResolveSizeBits - 1 -
-          xenos::kResolveAlignmentPixelsLog2;
+                                xenos::kResolveAlignmentPixelsLog2;
       uint32_t y_pixels_div_8 : xenos::kResolveSizeBits - 1 -
-          xenos::kResolveAlignmentPixelsLog2;
+                                xenos::kResolveAlignmentPixelsLog2;
       uint32_t width_pixels_div_8_minus_1 : xenos::kResolveSizeBits - 1 -
-          xenos::kResolveAlignmentPixelsLog2;
+                                            xenos::kResolveAlignmentPixelsLog2;
     };
     HostDepthStoreRectangleConstant() : constant(0) {
       static_assert_size(*this, sizeof(constant));
@@ -562,6 +593,14 @@ class RenderTargetCache {
   void GetResolveCopyRectanglesToDump(
       uint32_t base, uint32_t row_length, uint32_t rows, uint32_t pitch,
       std::vector<ResolveCopyDumpRectangle>& rectangles_out) const;
+
+  // True if everything owning the resolve source region is native scale, in
+  // which case the resolve can be done at 1x1 into shared memory instead of
+  // duplicating pixels into the scaled layout (which ruins linear filtering).
+  // Decided from actual ownership rather than resolve dimensions since one
+  // range can span both classes.
+  bool IsResolveSourceNativeOnly(uint32_t base, uint32_t row_length,
+                                 uint32_t rows, uint32_t pitch) const;
 
   // Sets up the needed render targets and transfers to perform a clear in a
   // resolve operation via a host render target clear. resolve_info is expected

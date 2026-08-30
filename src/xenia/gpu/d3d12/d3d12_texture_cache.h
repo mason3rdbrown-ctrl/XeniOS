@@ -59,8 +59,11 @@ class D3D12TextureCache final : public TextureCache {
       xenos::AnisoFilter aniso_filter : 3;  // 17
       uint32_t mip_min_level : 4;           // 21
       uint32_t mip_base_map : 1;            // 22
+      // Force the border color alpha to 1.0 (only meaningful with a border
+      // clamp mode).
+      uint32_t force_bc_w_to_max : 1;  // 23
       // Maximum mip level is in the texture resource itself, but mip_base_map
-      // can be used to limit fetching to mip_min_level.
+      // limits fetching to mip_min_level (level 0 when the base is available).
     };
 
     SamplerParameters() : value(0) { static_assert_size(*this, sizeof(value)); }
@@ -145,20 +148,26 @@ class D3D12TextureCache final : public TextureCache {
     assert_true(IsDrawResolutionScaled());
     GetCurrentScaledResolveBuffer().SetUAVBarrierPending();
   }
-  // Accessors for scaled resolve range info (for readback resolve path).
+  // The range specified in the last successful MakeScaledResolveRangeCurrent
+  // call, in the scaled physical memory address space.
   uint64_t GetCurrentScaledResolveRangeStartScaled() const {
+    assert_true(IsDrawResolutionScaled());
     return scaled_resolve_current_range_start_scaled_;
   }
   uint64_t GetCurrentScaledResolveRangeLengthScaled() const {
+    assert_true(IsDrawResolutionScaled());
     return scaled_resolve_current_range_length_scaled_;
   }
-  // Returns the ID3D12Resource for the current scaled resolve buffer.
+  // The resource of the buffer containing the current scaled resolve range,
+  // and the offset of the start of the buffer within the scaled physical
+  // memory address space (the buffer index is also its gigabyte offset).
   ID3D12Resource* GetCurrentScaledResolveBufferResource() {
+    assert_true(IsDrawResolutionScaled());
     return GetCurrentScaledResolveBuffer().resource();
   }
-  // Returns the buffer index (gigabyte offset) for the current scaled resolve.
-  size_t GetCurrentScaledResolveBufferIndexPublic() const {
-    return GetCurrentScaledResolveBufferIndex();
+  uint64_t GetCurrentScaledResolveBufferBaseOffset() const {
+    assert_true(IsDrawResolutionScaled());
+    return uint64_t(GetCurrentScaledResolveBufferIndex()) << 30;
   }
 
   // Returns the ID3D12Resource of the front buffer texture (in
@@ -187,10 +196,10 @@ class D3D12TextureCache final : public TextureCache {
     LoadShaderIndex load_shader_signed;
 
     // Do NOT add integer DXGI formats to this - they are not filterable, can
-    // only be read with Load, not Sample! If any game is seen using num_format
-    // 1 for fixed-point formats (for floating-point, it's normally set to 1
-    // though), add a constant buffer containing multipliers for the
-    // textures and multiplication to the tfetch implementation.
+    // only be read with Load, not Sample! Games that fetch fixed-point formats
+    // are handled after sampling by scaling the normalized host value back to
+    // the guest integer range (see GetIntegerScaleBits). Keep these as
+    // sampled float/normalized views.
 
     // Whether the DXGI format, if not uncompressing the texture, consists of
     // blocks, thus copy regions must be aligned to block size (assuming it's
@@ -812,17 +821,16 @@ class D3D12TextureCache final : public TextureCache {
   D3D12CommandProcessor& command_processor_;
   bool bindless_resources_used_;
 
+  // Bits per format, for checking if the host format should be point-filtered.
+  uint64_t host_filterable_unsigned_ = 0;
+  uint64_t host_filterable_signed_ = 0;
+
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount>
       load_pipelines_;
   // Load pipelines for resolution-scaled resolve targets.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount>
       load_pipelines_scaled_;
-
-  // Mip generation for scaled resolve textures.
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> mip_gen_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> mip_gen_pipeline_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> mip_gen_3d_pipeline_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;

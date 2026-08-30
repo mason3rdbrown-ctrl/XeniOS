@@ -118,6 +118,8 @@ DEFINE_int32(priority_class, 0,
              "values: 0 - Normal, 1 - Above normal, 2 - High",
              "General");
 
+DECLARE_int32(console_type);
+
 namespace xe {
 using namespace xe::literals;
 
@@ -424,7 +426,11 @@ X_STATUS Emulator::Setup(
   // HLE kernel modules.
   LOAD_KERNEL_MODULE(xboxkrnl::XboxkrnlModule);
   LOAD_KERNEL_MODULE(xam::XamModule);
-  LOAD_KERNEL_MODULE(xbdm::XbdmModule);
+
+  // 415608C3 anti-cheat checks if XBDM is loaded.
+  if (cvars::console_type >= 0) {
+    LOAD_KERNEL_MODULE(xbdm::XbdmModule);
+  }
 #undef LOAD_KERNEL_MODULE
   plugin_loader_ = std::make_unique<xe::patcher::PluginLoader>(
       kernel_state_.get(), storage_root() / "plugins");
@@ -515,6 +521,10 @@ const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
     const std::filesystem::path& path, const std::string_view mount_path) {
   // Must check if the type has changed e.g. XamSwapDisc
   switch (GetFileSignature(path)) {
+    case FileSignatureType::XEX0:
+    case FileSignatureType::XEXQ:
+    case FileSignatureType::XEXH:
+    case FileSignatureType::XEX25:
     case FileSignatureType::XEX1:
     case FileSignatureType::XEX2:
     case FileSignatureType::ELF: {
@@ -534,6 +544,7 @@ const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
     case FileSignatureType::ZAR: {
       return std::make_unique<vfs::DiscZarchiveDevice>(mount_path, path);
     } break;
+    case FileSignatureType::XBE:
     case FileSignatureType::EXE:
     case FileSignatureType::Unknown:
     default:
@@ -633,6 +644,14 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   fclose(file);
 
   switch (magic_value) {
+    case xe::cpu::kXEX0Signature:
+      return FileSignatureType::XEX0;
+    case xe::cpu::kXEXQSignature:
+      return FileSignatureType::XEXQ;
+    case xe::cpu::kXEXHSignature:
+      return FileSignatureType::XEXH;
+    case xe::cpu::kXEX25Signature:
+      return FileSignatureType::XEX25;
     case xe::cpu::kXEX1Signature:
       return FileSignatureType::XEX1;
     case xe::cpu::kXEX2Signature:
@@ -645,6 +664,8 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
       return FileSignatureType::PIRS;
     case xe::vfs::kXSFSignature:
       return FileSignatureType::XISO;
+    case xe::cpu::kXBESignature:
+      return FileSignatureType::XBE;
     case xe::cpu::kElfSignature:
       return FileSignatureType::ELF;
     default:
@@ -692,6 +713,10 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
   X_STATUS mount_result = X_STATUS_SUCCESS;
 
   switch (GetFileSignature(path)) {
+    case FileSignatureType::XEX0:
+    case FileSignatureType::XEXQ:
+    case FileSignatureType::XEXH:
+    case FileSignatureType::XEX25:
     case FileSignatureType::XEX1:
     case FileSignatureType::XEX2:
     case FileSignatureType::ELF: {
@@ -711,6 +736,10 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     case FileSignatureType::ZAR: {
       mount_result = MountPath(path, "\\Device\\Cdrom0");
       return mount_result ? mount_result : LaunchDiscArchive(path);
+    } break;
+    case FileSignatureType::XBE: {
+      XELOGE("OG Xbox games are not supported");
+      return X_STATUS_NOT_SUPPORTED;
     } break;
     case FileSignatureType::EXE:
     case FileSignatureType::Unknown:

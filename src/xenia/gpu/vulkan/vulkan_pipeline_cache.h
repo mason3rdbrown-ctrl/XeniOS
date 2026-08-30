@@ -299,8 +299,6 @@ class VulkanPipelineCache {
     VkShaderModule tessellation_vertex_shader;   // VS for passing data to TCS.
     VkShaderModule tessellation_control_shader;  // TCS (hull shader).
     VkRenderPass render_pass;
-    // For dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3).
-    VulkanRenderTargetCache::RenderPassKey render_pass_key;
     // Priority for async compilation (higher = compiled sooner).
     // Pipelines that write to visible render targets get higher priority.
     uint8_t priority = 0;
@@ -402,8 +400,12 @@ class VulkanPipelineCache {
   VulkanRenderTargetCache& render_target_cache_;
   VkShaderStageFlags guest_shader_vertex_stages_;
 
-  // Cached SPIR-V version based on device capabilities.
-  unsigned int spirv_version_;
+  // Cached device float control features for geometry shader creation, so the
+  // built-in geometry shaders run under the same float semantics as the guest
+  // vertex and pixel shaders.
+  bool signed_zero_inf_nan_preserve_float32_ = false;
+  bool denorm_flush_to_zero_float32_ = false;
+  bool rounding_mode_rte_float32_ = false;
 
   // Temporary storage for AnalyzeUcode calls on the processor thread.
   StringBuffer ucode_disasm_buffer_;
@@ -503,10 +505,13 @@ class VulkanPipelineCache {
   // boot.
   bool startup_loading_ = false;
 
-  // Deferred destruction of pipelines.
+  // Deferred destruction of replaced shader modules and pipelines.
   // Pipelines are only destroyed after the GPU submission that might reference
   // them has completed (tracked via submission numbers from command processor).
   void ProcessDeferredDestructions();
+  std::vector<VkShaderModule> deferred_destroy_shader_modules_;
+  // Pipelines pending destruction, paired with the submission number they were
+  // last potentially used in. Only destroyed when that submission completes.
   std::vector<std::pair<VkPipeline, uint64_t>> deferred_destroy_pipelines_;
   std::mutex deferred_destroy_mutex_;
 

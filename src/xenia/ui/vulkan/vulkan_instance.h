@@ -27,9 +27,8 @@ namespace vulkan {
 
 class VulkanInstance {
  public:
-  // validation_level: 0=off, 1=standard layer, 2=+synchronization validation.
   static std::unique_ptr<VulkanInstance> Create(bool with_surface,
-                                                int validation_level);
+                                                bool try_enable_validation);
 
   VulkanInstance(const VulkanInstance&) = delete;
   VulkanInstance& operator=(const VulkanInstance&) = delete;
@@ -66,17 +65,9 @@ class VulkanInstance {
 #ifdef VK_USE_PLATFORM_XCB_KHR
 #include "xenia/ui/vulkan/functions/instance_khr_xcb_surface.inc"
 #endif
-    // VK_KHR_wayland_surface (#7)
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
-#include "xenia/ui/vulkan/functions/instance_khr_wayland_surface.inc"
-#endif
     // VK_KHR_android_surface (#9)
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
 #include "xenia/ui/vulkan/functions/instance_khr_android_surface.inc"
-#endif
-    // VK_EXT_metal_surface (#218)
-#ifdef VK_USE_PLATFORM_METAL_EXT
-#include "xenia/ui/vulkan/functions/instance_ext_metal_surface.inc"
 #endif
     // VK_KHR_win32_surface (#10)
 #ifdef VK_USE_PLATFORM_WIN32_KHR
@@ -101,14 +92,8 @@ class VulkanInstance {
 #ifdef VK_USE_PLATFORM_XCB_KHR
     bool ext_KHR_xcb_surface = false;  // #6
 #endif
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
-    bool ext_KHR_wayland_surface = false;  // #7
-#endif
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
     bool ext_KHR_android_surface = false;  // #9
-#endif
-#ifdef VK_USE_PLATFORM_METAL_EXT
-    bool ext_EXT_metal_surface = false;  // #218
 #endif
 #ifdef VK_USE_PLATFORM_WIN32_KHR
     bool ext_KHR_win32_surface = false;  // #10
@@ -130,7 +115,7 @@ class VulkanInstance {
 
   std::unique_ptr<RenderDocAPI> renderdoc_api_;
 
-#if XE_PLATFORM_LINUX || XE_PLATFORM_APPLE
+#if XE_PLATFORM_LINUX
   void* loader_ = nullptr;
 #elif XE_PLATFORM_WIN32
   HMODULE loader_ = nullptr;

@@ -1,0 +1,89 @@
+name: Codex iOS Canary Latest Port IPA
+
+"on":
+  workflow_dispatch:
+  push:
+    branches:
+      - "codex/ios-canary-latest-port-20260830"
+
+concurrency:
+  group: "codex-ios-canary-latest-port-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build-ios-ipa:
+    name: Build iOS IPA
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Apple build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local attempts=0
+            until "$@"; do
+              attempts=$((attempts + 1))
+              if [ "$attempts" -ge 5 ]; then
+                return 1
+              fi
+              sleep 5
+            done
+          }
+
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          chmod +x xb xenia-build.py tools/build_apple_release.sh tools/package_ios_ipa.sh
+
+          retry git submodule update --init --depth=1 --recursive -j"$(sysctl -n hw.ncpu)"
+          retry git -C third_party/DirectXShaderCompiler submodule update --init --depth=1 \
+            external/SPIRV-Headers external/SPIRV-Tools
+
+          ./xenia-build.py fetchdata
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_26.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app
+          else
+            sudo xcode-select -s /Applications/Xcode.app
+          fi
+          xcodebuild -version
+
+      - name: Build ad-hoc iOS IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p scratch/artifacts
+          ./tools/build_apple_release.sh \
+            --out scratch/artifacts \
+            --channel preview \
+            --stage alpha \
+            --config release \
+            --version 2.0.1 \
+            --build-number "${GITHUB_RUN_NUMBER}" \
+            --ios-min 18.0 \
+            --random-ios-bundle-id \
+            --skip-macos-arm64 \
+            --skip-macos-x86_64 \
+            --skip-macos-universal \
+            2>&1 | tee scratch/artifacts/ios-build.log
+
+          test -f scratch/artifacts/xenios_ios_iphone_ipad.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenios-canary-latest-ios-ipa
+          path: |
+            scratch/artifacts/xenios_ios_iphone_ipad.ipa
+            scratch/artifacts/ios-build.log
+          if-no-files-found: error
+          overwrite: true

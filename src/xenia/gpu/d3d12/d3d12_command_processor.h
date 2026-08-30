@@ -57,7 +57,6 @@ struct MemExportRange {
   uint32_t base_address_dwords;
   uint32_t size_dwords;
 };
-
 class D3D12CommandProcessor final : public CommandProcessor {
  protected:
 #define OVERRIDING_BASE_CMDPROCESSOR
@@ -69,8 +68,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   ~D3D12CommandProcessor();
 
   void ClearCaches() override;
-  void InvalidateGpuMemory() override;
-  void ClearReadbackBuffers() override;
 
   void InitializeShaderStorage(
       const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
@@ -109,12 +106,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void NotifyQueueOperationsDoneDirectly() {
     queue_operations_done_since_submission_signal_ = true;
   }
-
-  // Debug marker methods - public so subsystems can annotate their operations.
-  void PushDebugMarker(const char* format, ...);
-  void PopDebugMarker();
-  void InsertDebugMarker(const char* format, ...);
-  bool debug_markers_enabled() const { return debug_markers_enabled_; }
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
   uint64_t GetCompletedFrame() const { return frame_completed_; }
@@ -228,7 +219,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void SetStencilReference(uint32_t stencil_ref);
   void SetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology);
 
-  std::string GetTitleStateSuffix() const override;
+  // Returns the text to display in the GPU backend name in the window title.
+  std::string GetWindowTitleText() const;
 
  protected:
   bool SetupContext() override;
@@ -318,7 +310,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
 
-  Shader* LoadShader(xenos::ShaderType shader_type,
+  Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address,
                      uint32_t dword_count) override;
 
@@ -329,9 +321,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   bool IssueCopy() override;
   XE_NOINLINE
   bool IssueCopy_ReadbackResolvePath();
-  void IssueDraw_MemexportReadbackFullPath(uint32_t memexport_total_size);
-  void IssueDraw_MemexportReadbackFastPath(uint32_t memexport_total_size);
-
   void InitializeTrace() override;
 
  private:
@@ -463,10 +452,12 @@ class D3D12CommandProcessor final : public CommandProcessor {
       D3D12_CPU_DESCRIPTOR_HANDLE& cpu_handle_out,
       D3D12_GPU_DESCRIPTOR_HANDLE& gpu_handle_out);
 
-  void UpdateFixedFunctionState(const draw_util::ViewportInfo& viewport_info,
-                                const draw_util::Scissor& scissor,
-                                bool primitive_polygonal,
-                                reg::RB_DEPTHCONTROL normalized_depth_control);
+  void UpdateFixedFunctionState(
+      const draw_util::ViewportInfo& viewport_info,
+      const draw_util::Scissor& scissor, bool primitive_polygonal,
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask,
+      uint32_t bound_depth_and_color_render_target_bits);
 
   template <bool primitive_polygonal, bool edram_rov_used>
   XE_NOINLINE void UpdateSystemConstantValues_Impl(
@@ -505,6 +496,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
   ID3D12Resource* RequestReadbackBuffer(uint32_t size);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+  void WriteZPDROVCounterRawUAVDescriptor(
+      D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
   // ZPD occlusion queries backend.
   // BeginQuery/EndQuery must be in the same command list, segments split at
@@ -517,8 +510,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
     zpd_active_query_index_ = UINT32_MAX;
     zpd_active_query_generation_ = 0;
     zpd_active_query_is_rov_ = false;
+    zpd_query_pool_needs_rov_counter_ = false;
     bindful_zpd_rov_counter_buffer_ = nullptr;
     bindful_zpd_rov_counter_capacity_ = 0;
+    if (!bindless_resources_used_) {
+      draw_view_bindful_heap_index_ =
+          ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
+    }
     if (zpd_host_query_pool_) {
       zpd_host_query_pool_->Shutdown();
     }
@@ -546,12 +544,14 @@ class D3D12CommandProcessor final : public CommandProcessor {
     uint64_t submission = 0;
     uint32_t query_index = UINT32_MAX;
     uint32_t query_generation = 0;
+    uint32_t scale_area = 1;
     bool uses_rov_counter = false;
     ReportHandle report_handle = kInvalidReportHandle;
   };
   uint32_t zpd_active_query_index_ = UINT32_MAX;
   uint32_t zpd_active_query_generation_ = 0;
   bool zpd_active_query_is_rov_ = false;
+  bool zpd_query_pool_needs_rov_counter_ = false;
   std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
 
   std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline> completion_timeline_;
@@ -598,8 +598,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
 
   std::unique_ptr<D3D12ZPDQueryPool> zpd_host_query_pool_;
-  // Tracks the ROV counter buffer captured by the current bindful page so we
-  // can invalidate the page when the counter resource changes.
   ID3D12Resource* bindful_zpd_rov_counter_buffer_ = nullptr;
   uint32_t bindful_zpd_rov_counter_capacity_ = 0;
 
@@ -718,34 +716,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_extreme_pipeline_;
 
-  // Resolve downscale compute shader for scaled resolution readback.
-  // Downscales scaled resolve buffer data back to 1x resolution on the GPU,
-  // avoiding expensive CPU-side downscaling and reducing PCIe bandwidth.
-  struct ResolveDownscaleConstants {
-    uint32_t scale_x;          // 1 to kMaxDrawResolutionScaleAlongAxis
-    uint32_t scale_y;          // 1 to kMaxDrawResolutionScaleAlongAxis
-    uint32_t pixel_size_log2;  // 0=8bit, 1=16bit, 2=32bit, 3=64bit
-    uint32_t tile_count;       // Number of 32x32 tiles to process
-    // Byte offset into the source buffer. Always 0 on D3D12 (the offset is
-    // baked into the source SRV); kept for a shared shader with Vulkan.
-    uint32_t source_offset_bytes;
-    // When non-zero, apply half-pixel offset correction by sampling from
-    // (scale/2, scale/2) within each scaled block instead of (0, 0).
-    uint32_t half_pixel_offset;
-  };
-  enum class ResolveDownscaleRootParameter : UINT {
-    kConstants,
-    kSource,
-    kDestination,
-
-    kCount,
-  };
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> resolve_downscale_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> resolve_downscale_pipeline_;
-  // Intermediate buffer for downscaled output (DEFAULT heap, UAV-capable).
-  Microsoft::WRL::ComPtr<ID3D12Resource> resolve_downscale_buffer_;
-  uint32_t resolve_downscale_buffer_size_ = 0;
-
   // PWL gamma ramp can result in values with more precision than 10bpc. Though
   // those sub-10bpc bits don't have any noticeable visual effect, so normally
   // R10G10B10A2_UNORM is enough. But what's the most important is that for the
@@ -778,25 +748,43 @@ class D3D12CommandProcessor final : public CommandProcessor {
   struct ReadbackBuffer {
     ID3D12Resource* buffers[2] = {nullptr, nullptr};
     uint32_t sizes[2] = {0, 0};
-    void* mapped_data[2] = {nullptr, nullptr};  // Persistent mappings
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
   };
-
-  // Helper to evict old readback buffers from a cache map
-  void EvictOldReadbackBuffers(
-      std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
-
   // Map: (written_address << 32 | written_length) -> ReadbackBuffer
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
 
-  // Simple single buffer for memexport (full mode - always syncs, no
-  // double-buffering)
+  // Simple single buffer for memexport (always syncs, no double-buffering)
   ID3D12Resource* memexport_readback_buffer_ = nullptr;
   uint32_t memexport_readback_buffer_size_ = 0;
 
-  // Per-memexport double-buffered readback for fast mode (delayed sync)
-  std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+  // Resolve downscale compute shader for scaled resolution readback,
+  // reversing the scaled resolve buffer packing back to 1x on the GPU.
+  struct ResolveDownscaleConstants {
+    uint32_t scale_x;          // 1 to kMaxDrawResolutionScaleAlongAxis
+    uint32_t scale_y;          // 1 to kMaxDrawResolutionScaleAlongAxis
+    uint32_t pixel_size_log2;  // 0=8bit, 1=16bit, 2=32bit, 3=64bit
+    uint32_t tile_count;       // Number of 32x32 tiles to process
+    // Byte offset into the source buffer. Always 0 on D3D12 (the offset is
+    // baked into the source SRV). Kept for a shader shared with Vulkan.
+    uint32_t source_offset_bytes;
+    // When non-zero, sample from (scale/2, scale/2) within each scaled block
+    // instead of (0, 0).
+    uint32_t half_pixel_offset;
+  };
+  enum class ResolveDownscaleRootParameter : UINT {
+    kConstants,
+    kSource,
+    kDestination,
+
+    kCount,
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> resolve_downscale_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> resolve_downscale_pipeline_;
+  // Intermediate buffer for downscaled output (DEFAULT heap, UAV-capable),
+  // kept in UNORDERED_ACCESS state between resolves.
+  Microsoft::WRL::ComPtr<ID3D12Resource> resolve_downscale_buffer_;
+  uint32_t resolve_downscale_buffer_size_ = 0;
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;
@@ -902,10 +890,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
-
-  // Debug marker support for PIX/RenderDoc/debug tools.
-  bool debug_markers_enabled_ = false;
-  void UpdateDebugMarkersEnabled();
 };
 
 }  // namespace d3d12

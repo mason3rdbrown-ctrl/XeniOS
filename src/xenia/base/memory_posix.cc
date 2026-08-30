@@ -33,6 +33,7 @@
 #endif  // XE_PLATFORM_APPLE
 
 #include "xenia/base/logging.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
@@ -45,6 +46,19 @@
 
 #include "xenia/base/main_android.h"
 #endif
+
+#if XE_PLATFORM_GNU_LINUX
+#ifndef MFD_EXEC
+#define MFD_EXEC 0x0010U
+#endif
+
+DEFINE_bool(use_shm_open, false,
+            "Back guest memory and the code cache with a /dev/shm file instead "
+            "of memfd.\n"
+            "Exposes both as named files that other processes can open to "
+            "inspect guest memory or JIT output while a title runs.",
+            "Linux");
+#endif  // XE_PLATFORM_GNU_LINUX
 
 namespace xe {
 namespace memory {
@@ -501,6 +515,29 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
   InstallCleanupHandlers();
   return ret;
 #else
+#if XE_PLATFORM_GNU_LINUX
+  // memfd is unaffected by noexec /dev/shm and needs no cleanup on exit.
+  if (!cvars::use_shm_open) {
+    const bool needs_exec = access == PageAccess::kExecuteReadOnly ||
+                            access == PageAccess::kExecuteReadWrite;
+    int memfd =
+        memfd_create(path.c_str(), MFD_CLOEXEC | (needs_exec ? MFD_EXEC : 0u));
+    if (memfd < 0 && needs_exec && errno == EINVAL) {
+      memfd = memfd_create(path.c_str(), MFD_CLOEXEC);
+    }
+    if (memfd >= 0) {
+      if (ftruncate(memfd, length) < 0) {
+        XELOGE("ftruncate(memfd {}, 0x{:X}) failed: {} ({})", path.string(),
+               length, strerror(errno), errno);
+        close(memfd);
+        return kFileMappingHandleInvalid;
+      }
+      return memfd;
+    }
+    XELOGW("memfd_create({}) failed: {} ({}), falling back to shm_open",
+           path.string(), strerror(errno), errno);
+  }
+#endif  // XE_PLATFORM_GNU_LINUX
   auto full_path = "/" / path;
   int ret = shm_open(full_path.c_str(), oflag, 0777);
   if (ret < 0) {

@@ -29,11 +29,11 @@ DEFINE_bool(dxbc_switch, true,
             "(possibly the shader compiler tries to flatten them). On Intel "
             "HD Graphics, this is ignored because of a crash with the switch "
             "instruction.",
-            "GPU");
+            "GPU.Debug");
 DEFINE_bool(dxbc_source_map, false,
             "Disassemble Xenos instructions as comments in the resulting DXBC "
             "for debugging.",
-            "GPU");
+            "GPU.Debug");
 
 namespace xe {
 namespace gpu {
@@ -136,7 +136,6 @@ void DxbcShaderTranslator::Reset() {
   cbuffer_index_bool_loop_constants_ = kBindingIndexUnallocated;
   cbuffer_index_fetch_constants_ = kBindingIndexUnallocated;
   cbuffer_index_descriptor_indices_ = kBindingIndexUnallocated;
-  texture_fetch_constant_dword_mask_.fill(0);
 
   system_constants_used_ = 0;
 
@@ -734,16 +733,17 @@ void DxbcShaderTranslator::StartPixelShader() {
     a_.OpRoundNI(dxbc::Dest::R(param_gen_temp, 0b0011),
                  dxbc::Src::V1D(in_reg_ps_position_));
     uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) |
-        (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+        uint32_t(GetCurrentDrawResolutionScaleX() > 1) |
+        (uint32_t(GetCurrentDrawResolutionScaleY() > 1) << 1);
     if (resolution_scaled_axes) {
       // Revert resolution scale - after truncating, so if the pixel position
       // is passed to tfetch (assuming the game doesn't round it by itself),
       // it will be sampled with higher resolution too.
-      a_.OpMul(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes),
-               dxbc::Src::R(param_gen_temp),
-               dxbc::Src::LF(1.0f / draw_resolution_scale_x_,
-                             1.0f / draw_resolution_scale_y_, 1.0f, 1.0f));
+      a_.OpMul(
+          dxbc::Dest::R(param_gen_temp, resolution_scaled_axes),
+          dxbc::Src::R(param_gen_temp),
+          dxbc::Src::LF(1.0f / GetCurrentDrawResolutionScaleX(),
+                        1.0f / GetCurrentDrawResolutionScaleY(), 1.0f, 1.0f));
     }
     if (shader_modification.pixel.param_gen_point) {
       // A point - always front-facing (the upper bit of X is 0), not a line
@@ -807,8 +807,8 @@ void DxbcShaderTranslator::StartPixelShader() {
     dxbc::Src memexport_enabled_src(dxbc::Src::R(
         system_temp_memexport_enabled_and_eM_written_, dxbc::Src::kXXXX));
     uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) |
-        (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+        uint32_t(GetCurrentDrawResolutionScaleX() > 1) |
+        (uint32_t(GetCurrentDrawResolutionScaleY() > 1) << 1);
     if (resolution_scaled_axes) {
       uint32_t memexport_condition_temp = PushSystemTemp();
       // Only do memexport for one host pixel in a guest pixel - prefer the
@@ -822,12 +822,12 @@ void DxbcShaderTranslator::StartPixelShader() {
       a_.OpUDiv(dxbc::Dest::Null(),
                 dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
                 dxbc::Src::R(memexport_condition_temp),
-                dxbc::Src::LU(draw_resolution_scale_x_,
-                              draw_resolution_scale_y_, 0, 0));
+                dxbc::Src::LU(GetCurrentDrawResolutionScaleX(),
+                              GetCurrentDrawResolutionScaleY(), 0, 0));
       a_.OpIEq(dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
                dxbc::Src::R(memexport_condition_temp),
-               dxbc::Src::LU(draw_resolution_scale_x_ >> 1,
-                             draw_resolution_scale_y_ >> 1, 0, 0));
+               dxbc::Src::LU(GetCurrentDrawResolutionScaleX() >> 1,
+                             GetCurrentDrawResolutionScaleY() >> 1, 0, 0));
       for (uint32_t i = 0; i < 2; ++i) {
         if (!(resolution_scaled_axes & (1 << i))) {
           continue;
@@ -1369,44 +1369,6 @@ void DxbcShaderTranslator::PostTranslation() {
   DxbcShader* dxbc_shader = dynamic_cast<DxbcShader*>(&translation.shader());
   if (dxbc_shader && !dxbc_shader->bindings_setup_entered_.test_and_set(
                          std::memory_order_relaxed)) {
-    uint32_t used_cbuffer_mask = 0;
-    auto mark_used_cbuffer = [&](CbufferRegister cbuffer_register) {
-      used_cbuffer_mask |= uint32_t(1) << uint32_t(cbuffer_register);
-    };
-    mark_used_cbuffer(CbufferRegister::kSystemConstants);
-    if (cbuffer_index_float_constants_ != kBindingIndexUnallocated) {
-      mark_used_cbuffer(CbufferRegister::kFloatConstants);
-    }
-    if (cbuffer_index_bool_loop_constants_ != kBindingIndexUnallocated) {
-      mark_used_cbuffer(CbufferRegister::kBoolLoopConstants);
-    }
-    if (cbuffer_index_fetch_constants_ != kBindingIndexUnallocated) {
-      mark_used_cbuffer(CbufferRegister::kFetchConstants);
-    }
-    if (cbuffer_index_descriptor_indices_ != kBindingIndexUnallocated) {
-      mark_used_cbuffer(CbufferRegister::kDescriptorIndices);
-    }
-    dxbc_shader->used_cbuffer_mask_ = used_cbuffer_mask;
-
-    dxbc_shader->fetch_constant_dword_mask_ =
-        texture_fetch_constant_dword_mask_;
-    const Shader::ConstantRegisterMap& constant_map =
-        dxbc_shader->constant_register_map();
-    for (uint32_t i = 0; i < xe::countof(constant_map.vertex_fetch_bitmap);
-         ++i) {
-      uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
-      uint32_t bit_index;
-      while (xe::bit_scan_forward(vfetch_bits_remaining, &bit_index)) {
-        vfetch_bits_remaining = xe::clear_lowest_bit(vfetch_bits_remaining);
-        const uint32_t vfetch_index = i * 32 + bit_index;
-        const uint32_t dword_index = vfetch_index * 2;
-        dxbc_shader->fetch_constant_dword_mask_[dword_index >> 5] |=
-            uint32_t(1) << (dword_index & 31);
-        dxbc_shader->fetch_constant_dword_mask_[(dword_index + 1) >> 5] |=
-            uint32_t(1) << ((dword_index + 1) & 31);
-      }
-    }
-
     dxbc_shader->texture_bindings_.clear();
     dxbc_shader->texture_bindings_.reserve(texture_bindings_.size());
     dxbc_shader->used_texture_mask_ = 0;
@@ -2232,6 +2194,9 @@ constexpr DxbcShaderTranslator::SystemConstantRdef
 
         {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4,
          sizeof(float) * 4},
+
+        {"xe_texture_integer_scale_bits", ShaderRdefTypeIndex::kUint4Array8,
+         sizeof(uint32_t) * 32},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {
@@ -3241,20 +3206,13 @@ void DxbcShaderTranslator::WriteOutputSignature() {
           cull_distance.component_type =
               dxbc::SignatureRegisterComponentType::kFloat32;
           cull_distance.register_index = clip_cull_distance_register;
-          // Calculate which components the cull distance occupies in this
-          // register. Cull distances are packed after clip distances.
-          // First component of cull distance in this register.
-          uint32_t cull_start_in_register =
-              (i < clip_distance_count) ? (clip_distance_count & 3) : 0;
-          // How many cull distance components are in this register.
-          uint32_t cull_components_before_this_register =
-              (i < clip_distance_count) ? 0 : (i - clip_distance_count);
-          uint32_t cull_count_in_register = std::min(
-              cull_distance_count - cull_components_before_this_register,
-              UINT32_C(4) - cull_start_in_register);
           uint8_t cull_distance_mask =
-              ((UINT8_C(1) << cull_count_in_register) - 1)
-              << cull_start_in_register;
+              (UINT8_C(1) << std::min(cull_distance_count - i, UINT32_C(4))) -
+              1;
+          if (i < clip_distance_count) {
+            cull_distance_mask &=
+                ~((UINT8_C(1) << (clip_distance_count - i)) - 1);
+          }
           cull_distance.mask = cull_distance_mask;
           cull_distance.never_writes_mask = cull_distance_mask ^ 0b1111;
         }
