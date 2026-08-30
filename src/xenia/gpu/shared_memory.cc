@@ -129,6 +129,25 @@ void SharedMemory::ClearCache() {
   SetSystemPageBlocksValidWithGpuDataWritten();
 }
 
+void SharedMemory::InvalidateAllPages() {
+  if (!system_page_flags_valid_ || !system_page_flags_valid_and_gpu_written_ ||
+      !num_system_page_flags_) {
+    return;
+  }
+
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    std::fill(system_page_flags_valid_,
+              system_page_flags_valid_ + num_system_page_flags_, 0);
+    std::fill(system_page_flags_valid_and_gpu_written_,
+              system_page_flags_valid_and_gpu_written_ +
+                  num_system_page_flags_,
+              0);
+  }
+
+  FireWatches(0, (kBufferSize - 1) >> page_size_log2_, false);
+}
+
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   auto global_lock = global_critical_region_.Acquire();
 

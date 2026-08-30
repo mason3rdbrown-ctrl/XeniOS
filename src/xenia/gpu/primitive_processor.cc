@@ -1040,6 +1040,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
   result_out.host_vertex_shader_type = host_vertex_shader_type;
   result_out.tessellation_mode = tessellation_mode;
   result_out.host_draw_vertex_count = cacheable.host_draw_vertex_count;
+  result_out.guest_draw_vertex_count = guest_draw_vertex_count;
   result_out.line_loop_closing_index = line_loop_closing_index;
   result_out.index_buffer_type = cacheable.index_buffer_type;
   result_out.guest_index_base = guest_index_base;

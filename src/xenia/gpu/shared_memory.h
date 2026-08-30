@@ -27,6 +27,7 @@ class SharedMemory {
   // Call in the implementation-specific ClearCache.
   virtual void ClearCache();
   virtual void SetSystemPageBlocksValidWithGpuDataWritten();
+  void InvalidateAllPages();
 
   typedef void (*GlobalWatchCallback)(
       const global_unique_lock_type& global_lock, void* context,
