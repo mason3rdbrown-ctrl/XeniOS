@@ -70,7 +70,7 @@ jobs:
             --version 2.0.1 \
             --build-number "${GITHUB_RUN_NUMBER}" \
             --ios-min 18.0 \
-            --random-ios-bundle-id \
+            --ios-bundle-id com.xenios.eeae5e4e8080b380 \
             --skip-macos-arm64 \
             --skip-macos-x86_64 \
             --skip-macos-universal \
