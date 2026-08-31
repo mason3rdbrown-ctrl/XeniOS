@@ -31,9 +31,15 @@
 // TODO(benvanik): move xbox.h out
 #include "xenia/xbox.h"
 
+#if XE_PLATFORM_IOS
+#define XE_DEFAULT_EMIT_INLINE_MMIO_CHECKS true
+#else
+#define XE_DEFAULT_EMIT_INLINE_MMIO_CHECKS false
+#endif  // XE_PLATFORM_IOS
+
 DEFINE_bool(protect_zero, true, "Protect the zero page from reads and writes.",
             "Memory");
-DEFINE_bool(emit_inline_mmio_checks, false,
+DEFINE_bool(emit_inline_mmio_checks, XE_DEFAULT_EMIT_INLINE_MMIO_CHECKS,
             "Emit inline MMIO range checks for all I32 loads/stores instead "
             "of relying on exception-based MMIO detection.",
             "CPU");
@@ -111,23 +117,14 @@ void CrashDump() {
   --in_crash_dump;
 }
 
-static inline bool ShouldSkipHostCommit(const BaseHeap& heap) {
-#if XE_PLATFORM_APPLE
-  // On Apple ARM64 the host page size is 16 KB, and mprotect-based "commit"
-  // creates fragmentation in the 0..512 MB parent physical heap.
-  if (heap.heap_type() == HeapType::kGuestPhysical && heap.heap_base() == 0x0 &&
-      xe::memory::page_size() > 0x1000) {
-    return true;
-  }
-#elif XE_PLATFORM_LINUX
-  // When the host page size is larger than 4 KB (e.g. 64 KB on some ARM64
-  // Linux kernels), mprotect on 4 KB guest page boundaries fails with EINVAL.
-  // All heaps are backed by a shared file mapping (MapFileView) that is
-  // already mapped RW, so the commit is a no-op — skip it.
+static inline bool ShouldSkipHostCommit(const BaseHeap&) {
+  // When the host page size is larger than 4 KB (e.g. 16 KB on Apple ARM64,
+  // 64 KB on some ARM64 Linux kernels), mprotect on 4 KB guest page boundaries
+  // fails with EINVAL. All heaps are backed by a shared file mapping
+  // (MapFileView) that is already mapped RW, so the commit is a no-op; skip it.
   if (xe::memory::page_size() > 0x1000) {
     return true;
   }
-#endif
   return false;
 }
 

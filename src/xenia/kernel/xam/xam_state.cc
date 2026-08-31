@@ -46,7 +46,8 @@ void XamState::LoadLanguageLocaleFallback() {
 
   if (kernel_state_->memory()
           ->LookupHeap(0x80000000)
-          ->AllocFixed(array_start, 0xC8, 0x1000, kMemoryAllocationCommit,
+          ->AllocFixed(array_start, 0xC8, 0x1000,
+                       kMemoryAllocationReserve | kMemoryAllocationCommit,
                        kMemoryProtectRead | kMemoryProtectWrite)) {
     char16_t* ptr =
         kernel_state_->memory()->TranslateVirtual<char16_t*>(array_start);
@@ -66,7 +67,8 @@ void XamState::LoadIptvServiceName() {
 
   if (kernel_state_->memory()
           ->LookupHeap(0x80000000)
-          ->AllocFixed(address, 0x78, 0x1000, kMemoryAllocationCommit,
+          ->AllocFixed(address, 0x78, 0x1000,
+                       kMemoryAllocationReserve | kMemoryAllocationCommit,
                        kMemoryProtectRead | kMemoryProtectWrite)) {
     iptv_name_address_ = address;
   }
