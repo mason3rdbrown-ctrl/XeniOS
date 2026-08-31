@@ -5259,9 +5259,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
           provider.OffsetViewDescriptor(
               view_bindless_heap_gpu_start_,
               uint32_t(current_shared_memory_binding_is_uav_.value()
-                           ? SystemBindlessView ::
+                           ? SystemBindlessView::
                                  kNullRawSRVAndSharedMemoryRawUAVStart
-                           : SystemBindlessView ::
+                           : SystemBindlessView::
                                  kSharedMemoryRawSRVAndNullRawUAVStart));
     } else {
       gpu_handle_shared_memory_and_bindful_edram =

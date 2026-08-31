@@ -860,8 +860,7 @@ bool TextureCache::DestroyOldestTextureIfUnused(
   return true;
 }
 
-TextureCache::TextureKey TextureCache::GetHostTextureKey(
-    TextureKey key) const {
+TextureCache::TextureKey TextureCache::GetHostTextureKey(TextureKey key) const {
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled &&
       IsScaledResolveSupportedForFormat(key)) {

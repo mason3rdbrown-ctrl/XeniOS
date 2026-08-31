@@ -140,8 +140,7 @@ void SharedMemory::InvalidateAllPages() {
     std::fill(system_page_flags_valid_,
               system_page_flags_valid_ + num_system_page_flags_, 0);
     std::fill(system_page_flags_valid_and_gpu_written_,
-              system_page_flags_valid_and_gpu_written_ +
-                  num_system_page_flags_,
+              system_page_flags_valid_and_gpu_written_ + num_system_page_flags_,
               0);
   }
 
@@ -440,8 +439,7 @@ bool SharedMemory::RequestRanges(const Range* ranges, uint32_t range_count,
       }
 
       uint32_t page_first = range.start >> page_size_log2_;
-      uint32_t page_last =
-          (range.start + range.length - 1) >> page_size_log2_;
+      uint32_t page_last = (range.start + range.length - 1) >> page_size_log2_;
       uint32_t block_first = page_first >> 6;
       uint32_t block_last = page_last >> 6;
 
@@ -541,7 +539,8 @@ bool SharedMemory::IsRangeInvalid(uint32_t start, uint32_t length) const {
 }
 
 void SharedMemory::WatchRangeForCpuWrites(uint32_t start, uint32_t length) {
-  if (!length || start >= kBufferSize || !memory_invalidation_callback_handle_) {
+  if (!length || start >= kBufferSize ||
+      !memory_invalidation_callback_handle_) {
     return;
   }
   length = std::min(length, kBufferSize - start);

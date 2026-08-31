@@ -139,7 +139,8 @@ struct XECRYPT_RSAPUB_2048 {
 };
 static_assert_size(XECRYPT_RSAPUB_2048, 0x110);
 
-static constexpr uint8_t key39[] = {                 // pirs_retail_public
+static constexpr uint8_t key39[] = {
+    // pirs_retail_public
     0x00, 0x00, 0x00, 0x20,                          // cqw
     0x00, 0x00, 0x00, 0x03,                          // dwPubExp
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // qwReserved

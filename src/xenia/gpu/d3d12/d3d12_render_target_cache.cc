@@ -5223,7 +5223,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
               descriptor_gpu_handle =
                   command_processor_
                       .GetSystemBindlessViewHandlePair(
-                          D3D12CommandProcessor::SystemBindlessView ::
+                          D3D12CommandProcessor::SystemBindlessView::
                               kEdramR32UintSRV)
                       .second;
             } else {

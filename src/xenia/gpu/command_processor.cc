@@ -1493,9 +1493,9 @@ void CommandProcessor::UpdateZPDScale(uint32_t scale_area) {
 
 void CommandProcessor::OnZPDQueryResolved(ReportHandle report_handle,
                                           uint64_t raw_samples) {
-  OnZPDQueryResolved(report_handle, raw_samples,
-                     zpd_draw_resolution_scale_x_ *
-                         zpd_draw_resolution_scale_y_);
+  OnZPDQueryResolved(
+      report_handle, raw_samples,
+      zpd_draw_resolution_scale_x_ * zpd_draw_resolution_scale_y_);
 }
 
 void CommandProcessor::OnZPDQueryResolved(ReportHandle report_handle,

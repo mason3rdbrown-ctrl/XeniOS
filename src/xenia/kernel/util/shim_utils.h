@@ -613,7 +613,7 @@ using xe::cpu::ExportTag;
                    xe::kernel::shim::KernelModuleId::module_name,          \
                    ordinals::name>(&name##_entry))>>;                      \
   const auto EXPORT_##module_name##_##name = RegisterExport_##module_name( \
-      _register_##module_name##_##name ::RegisterExport<                   \
+      _register_##module_name##_##name::RegisterExport<                    \
           &name##_entry, tags | (static_cast<xe::cpu::ExportTag::type>(    \
                                      xe::cpu::ExportCategory::category)    \
                                  << xe::cpu::ExportTag::CategoryShift)>(   \

@@ -1703,7 +1703,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
             intermediate_descriptor_write.pNext = nullptr;
             intermediate_descriptor_write.dstSet =
                 paint_context_.guest_output_descriptor_sets
-                    [PaintContext ::
+                    [PaintContext::
                          kGuestOutputDescriptorSetIntermediate0Sampled +
                      i];
             intermediate_descriptor_write.dstBinding = 0;

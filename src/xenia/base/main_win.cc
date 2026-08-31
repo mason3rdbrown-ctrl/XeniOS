@@ -96,8 +96,8 @@ bool ParseWin32LaunchArguments(
   int argc = wargc;
   char** argv = reinterpret_cast<char**>(alloca(sizeof(char*) * argc));
   for (int n = 0; n < argc; n++) {
-    int len = WideCharToMultiByte(CP_UTF8, 0, wargv[n], -1, nullptr, 0,
-                                  nullptr, nullptr);
+    int len = WideCharToMultiByte(CP_UTF8, 0, wargv[n], -1, nullptr, 0, nullptr,
+                                  nullptr);
     argv[n] = reinterpret_cast<char*>(alloca(sizeof(char) * len));
     WideCharToMultiByte(CP_UTF8, 0, wargv[n], -1, argv[n], len, nullptr,
                         nullptr);

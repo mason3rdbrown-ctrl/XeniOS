@@ -4902,7 +4902,7 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA) {
     flags |= SpirvShaderTranslator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad;
     if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32) {
-      flags |= SpirvShaderTranslator ::
+      flags |= SpirvShaderTranslator::
           kSysFlag_ComputeOrPrimitiveVertexIndexLoad32Bit;
     }
   }

@@ -64,13 +64,16 @@ uint32_t get_page_count(uint32_t value, uint32_t page_size) {
 /**
  * Memory map:
  * 0x00000000 - 0x3FFFFFFF (1024mb) - virtual 4k pages
+ *
  * 0x40000000 - 0x7EFFFFFF (1008mb) - virtual 64k pages
- * 0x7F000000 - 0x7FC7FFFF (12.5mb) - GPU writeback & XPS
- * 0x7FC80000 - 0x7FFFFFFF ( 3.5mb) - MMIO
+ * 0x7F000000 -
+ * 0x7FC7FFFF (12.5mb) - GPU writeback & XPS
+ * 0x7FC80000 - 0x7FFFFFFF ( 3.5mb)
+ * - MMIO
  * 0x80000000 - 0x8BFFFFFF ( 192mb) - xex 64k pages
- * 0x8C000000 - 0x8FFFFFFF (  64mb) - xex 64k pages (encrypted)
- * 0x90000000 - 0x9FFFFFFF ( 256mb) - xex 4k pages
- * 0xA0000000 - 0xBFFFFFFF ( 512mb) - physical 64k pages
+ * 0x8C000000 -
+ * 0x8FFFFFFF (  64mb) - xex 64k pages (encrypted) 0x90000000 - 0x9FFFFFFF (
+ * 256mb) - xex 4k pages 0xA0000000 - 0xBFFFFFFF ( 512mb) - physical 64k pages
  * 0xC0000000 - 0xDFFFFFFF          - physical 16mb pages
  * 0xE0000000 - 0xFFFFFFFF          - physical 4k pages
  *
@@ -269,8 +272,7 @@ bool Memory::Initialize() {
   heaps_.vE0000000.Initialize(this, virtual_membase_, HeapType::kGuestPhysical,
                               0xE0000000, 0x1FD00000, 4096, &heaps_.physical);
   heaps_.v7F000000.Initialize(this, virtual_membase_, HeapType::kGuestPhysical,
-                              0x7F000000, 0x00C80000, 4096,
-                              &heaps_.physical);
+                              0x7F000000, 0x00C80000, 4096, &heaps_.physical);
 
   // Protect the first and last 64kb of memory.
   heaps_.v00000000.AllocFixed(

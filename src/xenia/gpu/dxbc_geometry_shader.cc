@@ -153,8 +153,9 @@ void CreateDxbcGeometryShader(GeometryShaderKey key,
           shader_out.data() + rdef_constants_position_dwords);
       // float2 xe_point_constant_diameter
       static_assert(
-          sizeof(DxbcShaderTranslator::SystemConstants ::
-                     point_constant_diameter) == sizeof(float) * 2,
+          sizeof(
+              DxbcShaderTranslator::SystemConstants::point_constant_diameter) ==
+              sizeof(float) * 2,
           "DxbcShaderTranslator point_constant_diameter system constant size "
           "differs between the shader translator and geometry shader "
           "generation");
@@ -174,7 +175,7 @@ void CreateDxbcGeometryShader(GeometryShaderKey key,
       rdef_constant_point_constant_diameter.start_sampler = UINT32_MAX;
       // float2 xe_point_screen_diameter_to_ndc_radius
       static_assert(
-          sizeof(DxbcShaderTranslator::SystemConstants ::
+          sizeof(DxbcShaderTranslator::SystemConstants::
                      point_screen_diameter_to_ndc_radius) == sizeof(float) * 2,
           "DxbcShaderTranslator point_screen_diameter_to_ndc_radius system "
           "constant size differs between the shader translator and geometry "

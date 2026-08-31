@@ -32,8 +32,8 @@
 #include <mach/vm_region.h>
 #endif  // XE_PLATFORM_APPLE
 
-#include "xenia/base/logging.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"

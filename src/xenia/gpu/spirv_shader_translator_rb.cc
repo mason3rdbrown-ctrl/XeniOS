@@ -2913,7 +2913,7 @@ std::array<spv::Id, 2> SpirvShaderTranslator::FSI_ClampAndPackColor(
     format_switch_op->addIdOperand(block_format_2_10_10_10_float.getId());
     format_switch_op->addImmediateOperand(
         int32_t(RenderTargetCache::AddPSIColorFormatFlags(
-            xenos::ColorRenderTargetFormat ::
+            xenos::ColorRenderTargetFormat::
                 k_2_10_10_10_FLOAT_AS_16_16_16_16)));
     format_switch_op->addIdOperand(block_format_2_10_10_10_float.getId());
     format_switch_op->addImmediateOperand(
@@ -3286,7 +3286,7 @@ std::array<spv::Id, 4> SpirvShaderTranslator::FSI_UnpackColor(
     format_switch_op->addIdOperand(block_format_2_10_10_10_float.getId());
     format_switch_op->addImmediateOperand(
         int32_t(RenderTargetCache::AddPSIColorFormatFlags(
-            xenos::ColorRenderTargetFormat ::
+            xenos::ColorRenderTargetFormat::
                 k_2_10_10_10_FLOAT_AS_16_16_16_16)));
     format_switch_op->addIdOperand(block_format_2_10_10_10_float.getId());
     format_switch_op->addImmediateOperand(

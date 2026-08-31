@@ -602,7 +602,7 @@ Java_jp_xenia_emulator_WindowedAppActivity_initializeWindowedAppOnCreate(
     JNIEnv* jni_env, jobject activity, jstring windowed_app_identifier,
     jobject asset_manager) {
   return reinterpret_cast<jlong>(
-      xe::ui::AndroidWindowedAppContext ::
+      xe::ui::AndroidWindowedAppContext::
           JniActivityInitializeWindowedAppOnCreate(
               jni_env, activity, windowed_app_identifier, asset_manager));
 }
