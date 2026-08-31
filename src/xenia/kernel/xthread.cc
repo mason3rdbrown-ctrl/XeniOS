@@ -714,6 +714,15 @@ void XThread::Execute() {
     args.push_back(creation_params_.start_context);
     want_exit_code = true;
   }
+#if XE_PLATFORM_IOS
+  if (main_thread_) {
+    XELOGI("iOS: main XThread entering guest code entry={:08X}, "
+           "start_context={:08X}, xapi_thread_startup={:08X}, "
+           "stack={:08X}-{:08X}",
+           address, creation_params_.start_context,
+           creation_params_.xapi_thread_startup, stack_limit_, stack_base_);
+  }
+#endif  // XE_PLATFORM_IOS
 
   // Set up reentry mechanism for fiber-based stack switching.
   // When Reenter() is called (e.g., by KeSetCurrentStackPointers), it
@@ -780,6 +789,13 @@ void XThread::Execute() {
     }
   }
 #endif
+
+#if XE_PLATFORM_IOS
+  if (main_thread_) {
+    XELOGI("iOS: main XThread returned from guest code exit_code={}, r3={:016X}",
+           exit_code, thread_state_->context()->r[3]);
+  }
+#endif  // XE_PLATFORM_IOS
 
   // If we got here it means the execute completed without an exit being called.
   // Treat the return code as an implicit exit code (if desired).

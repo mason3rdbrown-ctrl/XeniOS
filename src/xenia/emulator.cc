@@ -2202,7 +2202,16 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // Resume the main thread now.
   // If the debugger has requested a suspend this will just decrement the
   // suspend count without resuming it until the debugger wants.
-  main_thread_->Resume();
+  uint32_t previous_suspend_count = 0;
+  X_STATUS resume_status = main_thread_->Resume(&previous_suspend_count);
+#if XE_PLATFORM_IOS
+  XELOGI("iOS: main XThread resume status {:08X}, previous_suspend_count={}, "
+         "entry={:08X}",
+         resume_status, previous_suspend_count, main_thread_->start_address());
+#endif  // XE_PLATFORM_IOS
+  if (XFAILED(resume_status)) {
+    return resume_status;
+  }
 
   return X_STATUS_SUCCESS;
 }

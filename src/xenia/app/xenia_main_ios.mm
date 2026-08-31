@@ -64,6 +64,8 @@
 #include "xenia/kernel/xam/xam_state.h"
 #include "xenia/patcher/patch_db.h"
 
+DECLARE_bool(a64_enable_host_guest_stack_synchronization);
+DECLARE_bool(emit_inline_mmio_checks);
 DECLARE_bool(present_letterbox);
 
 // CVars normally defined in xenia_main.cc (excluded on iOS).
@@ -190,6 +192,24 @@ void LogIOSProvisioningProfileHints() {
            contains_entitlement(
                "com.apple.security.files.user-selected.read-write"));
   }
+}
+
+void ApplyIOSLaunchCompatibilityCvars(const char* reason) {
+  if (!cvars::emit_inline_mmio_checks) {
+    XELOGW("iOS: forcing emit_inline_mmio_checks=true after {}",
+           reason ? reason : "config load");
+    cvars::emit_inline_mmio_checks = true;
+  }
+  if (!cvars::a64_enable_host_guest_stack_synchronization) {
+    XELOGW("iOS: forcing a64_enable_host_guest_stack_synchronization=true "
+           "after {}",
+           reason ? reason : "config load");
+    cvars::a64_enable_host_guest_stack_synchronization = true;
+  }
+  XELOGI("iOS: launch compatibility after {}: emit_inline_mmio_checks={}, "
+         "a64_enable_host_guest_stack_synchronization={}",
+         reason ? reason : "config load", cvars::emit_inline_mmio_checks,
+         cvars::a64_enable_host_guest_stack_synchronization);
 }
 
 std::string DisplayNameForPatchFile(const patcher::BundledPatchFile& bundled) {
@@ -606,6 +626,7 @@ bool EmulatorAppIOS::OnInitialize() {
   XELOGI("iOS: Storage root: {}", storage_root);
 
   config::SetupConfig(storage_root);
+  ApplyIOSLaunchCompatibilityCvars("global config");
 
   std::filesystem::path content_root = cvars::content_root;
   if (content_root.empty()) {
@@ -1328,6 +1349,7 @@ void EmulatorAppIOS::EmulatorThread(const std::filesystem::path& game_path,
   if (launched_with_game) {
     XELOGI("iOS: Loading game config for: {}", game_path.string());
     config::LoadGameConfigForFile(game_path);
+    ApplyIOSLaunchCompatibilityCvars("game config");
     app_context().CallInUIThread([this]() {
       ApplyGuestDisplayRefreshCapToWindowFromUIThread(cvars::guest_display_refresh_cap);
     });

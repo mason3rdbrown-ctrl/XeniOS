@@ -10,10 +10,12 @@
 #ifndef XENIA_KERNEL_KERNEL_STATE_H_
 #define XENIA_KERNEL_KERNEL_STATE_H_
 
+#include <atomic>
 #include <bitset>
 #include <condition_variable>
 #include <functional>
 #include <list>
+#include <memory>
 #include <vector>
 
 #include "xenia/base/bit_map.h"
@@ -42,6 +44,10 @@ class Emulator;
 namespace cpu {
 class Processor;
 }  // namespace cpu
+namespace threading {
+class Event;
+class HighResolutionTimer;
+}  // namespace threading
 }  // namespace xe
 
 namespace xe {
@@ -390,6 +396,7 @@ class KernelState {
 
   std::atomic<bool> dispatch_thread_running_;
   object_ref<XHostThread> dispatch_thread_;
+  std::unique_ptr<xe::threading::Event> dispatch_thread_ready_;
   // Must be guarded by the global critical region.
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;

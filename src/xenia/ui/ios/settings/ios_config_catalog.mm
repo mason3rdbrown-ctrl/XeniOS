@@ -455,9 +455,9 @@ static std::vector<IOSConfigSection> BuildCompatibilitySections() {
   AddBoolSetting(jit.items, "a64_enable_host_guest_stack_synchronization",
                  "A64 Stack Synchronization",
                  "ARM64-only compatibility path that keeps host and guest stacks "
-                 "synchronized across calls. Leave this off unless a game specifically "
-                 "needs it to boot or unwind correctly.",
-                 false);
+                 "synchronized across calls. Keep this enabled on iOS because many "
+                 "titles depend on it to boot or unwind correctly.",
+                 true);
   AddBoolSetting(jit.items, "ios_jit_brk_prepare_fallback",
                  "External JIT Prepare Fallback",
                  "iOS ARM64 only. If iOS denies JIT page protection changes, ask an "

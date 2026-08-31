@@ -168,6 +168,7 @@ void KernelState::ShutdownDispatchThread() {
     dispatch_thread_->Wait(0, 0, 0, nullptr);
 #endif  // XE_PLATFORM_IOS
   }
+  dispatch_thread_ready_.reset();
 }
 
 KernelState* KernelState::shared() { return shared_kernel_state_; }
@@ -592,11 +593,28 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
   // here).
   if (!dispatch_thread_running_) {
     dispatch_thread_running_ = true;
+#if XE_PLATFORM_IOS
+    dispatch_thread_ready_ =
+        xe::threading::Event::CreateManualResetEvent(false);
+    xe::threading::Event* dispatch_thread_ready =
+        dispatch_thread_ready_.get();
+#endif  // XE_PLATFORM_IOS
     dispatch_thread_ = object_ref<XHostThread>(new XHostThread(
         this, 128 * 1024, 0,
-        [this]() {
+        [this
+#if XE_PLATFORM_IOS
+         ,
+         dispatch_thread_ready
+#endif  // XE_PLATFORM_IOS
+        ]() {
           // As we run guest callbacks the debugger must be able to suspend us.
           dispatch_thread_->set_can_debugger_suspend(true);
+#if XE_PLATFORM_IOS
+          if (dispatch_thread_ready) {
+            dispatch_thread_ready->Set();
+          }
+          XELOGI("iOS: kernel dispatch thread entered");
+#endif  // XE_PLATFORM_IOS
 
           auto global_lock = global_critical_region_.AcquireDeferred();
           while (dispatch_thread_running_) {
@@ -634,7 +652,29 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
         },
         GetSystemProcess()));  // don't think an equivalent exists on real hw
     dispatch_thread_->set_name("Kernel Dispatch");
-    dispatch_thread_->Create();
+    X_STATUS create_status = dispatch_thread_->Create();
+    if (XFAILED(create_status)) {
+      XELOGE("Could not create kernel dispatch thread: {:08X}",
+             create_status);
+      dispatch_thread_running_ = false;
+      dispatch_thread_.reset();
+      dispatch_thread_ready_.reset();
+      return;
+    }
+#if XE_PLATFORM_IOS
+    if (dispatch_thread_ready_) {
+      auto ready_result =
+          xe::threading::Wait(dispatch_thread_ready_.get(), false,
+                              std::chrono::milliseconds(250));
+      if (ready_result == xe::threading::WaitResult::kSuccess) {
+        XELOGI("iOS: kernel dispatch thread ready before title launch");
+      } else {
+        XELOGW("iOS: kernel dispatch thread not ready before title launch "
+               "(wait_result={})",
+               static_cast<int>(ready_result));
+      }
+    }
+#endif  // XE_PLATFORM_IOS
   }
 }
 
