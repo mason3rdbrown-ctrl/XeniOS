@@ -540,8 +540,9 @@ X_STATUS XThread::Create() {
     // Start the thread now that we're all setup.
     if (fiber_) {
       kernel_state()->guest_scheduler()->MarkReady(this);
-    } else {
-      thread_->Resume();
+    } else if (!thread_->Resume()) {
+      XELOGE("CreateThread resume failed for handle {:08X}", handle());
+      return X_STATUS_UNSUCCESSFUL;
     }
   }
 
