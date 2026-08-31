@@ -716,11 +716,12 @@ void XThread::Execute() {
   }
 #if XE_PLATFORM_IOS
   if (main_thread_) {
-    XELOGI("iOS: main XThread entering guest code entry={:08X}, "
-           "start_context={:08X}, xapi_thread_startup={:08X}, "
-           "stack={:08X}-{:08X}",
-           address, creation_params_.start_context,
-           creation_params_.xapi_thread_startup, stack_limit_, stack_base_);
+    XELOGI(
+        "iOS: main XThread entering guest code entry={:08X}, "
+        "start_context={:08X}, xapi_thread_startup={:08X}, "
+        "stack={:08X}-{:08X}",
+        address, creation_params_.start_context,
+        creation_params_.xapi_thread_startup, stack_limit_, stack_base_);
   }
 #endif  // XE_PLATFORM_IOS
 
@@ -792,8 +793,9 @@ void XThread::Execute() {
 
 #if XE_PLATFORM_IOS
   if (main_thread_) {
-    XELOGI("iOS: main XThread returned from guest code exit_code={}, r3={:016X}",
-           exit_code, thread_state_->context()->r[3]);
+    XELOGI(
+        "iOS: main XThread returned from guest code exit_code={}, r3={:016X}",
+        exit_code, thread_state_->context()->r[3]);
   }
 #endif  // XE_PLATFORM_IOS
 
