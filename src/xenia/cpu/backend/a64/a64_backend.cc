@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/backend/a64/a64_backend.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 
@@ -550,6 +551,26 @@ void* A64HelperEmitter::EmitTryAcquireReservationHelper() {
   code_offsets.prolog_stack_alloc = getSize();
   code_offsets.body = getSize();
 
+  auto& no_prior_reservation = NewCachedLabel();
+
+  // PPC lwarx implicitly drops any prior reservation. If this thread still
+  // owns a cached reservation, clear its global bitmap bit before taking a new
+  // one so repeated reserved loads can't poison their own future stores.
+  ldr(w9, ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, flags))));
+  mov(w10, static_cast<uint32_t>(1u << kA64BackendHasReserveBit));
+  and_(w11, w9, w10);
+  cbz(w11, no_prior_reservation);
+  ldr(x12, ptr(x19, static_cast<uint32_t>(
+                        offsetof(A64BackendContext, cached_reserve_offset))));
+  ldr(w13, ptr(x19, static_cast<uint32_t>(
+                        offsetof(A64BackendContext, cached_reserve_bit))));
+  mov(x14, static_cast<uint64_t>(1));
+  lsl(x14, x14, x13);
+  ldclral(x14, x15, ptr(x12));
+  bic(w9, w9, w10);
+  str(w9, ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, flags))));
+  L(no_prior_reservation);
+
   // x2 = &reserve_helper_->blocks[0] (blocks[] is at offset 0 of
   // ReserveHelper).
   ldr(x2, ptr(x19, static_cast<uint32_t>(
@@ -621,6 +642,7 @@ void* A64HelperEmitter::EmitReservedStoreHelper(bool bit64) {
   code_offsets.body = getSize();
 
   auto& done = NewCachedLabel();
+  auto& release_cached_and_fail = NewCachedLabel();
 
   // had_reservation = flags & reserve_bit; clear the bit unconditionally
   // (PPC stwcx. always releases the reservation).
@@ -647,12 +669,12 @@ void* A64HelperEmitter::EmitReservedStoreHelper(bool bit64) {
   // behavior (its assert_always() is a no-op under NDEBUG).
   ldr(x12, ptr(x19, static_cast<uint32_t>(
                         offsetof(A64BackendContext, cached_reserve_offset))));
-  sub(x12, x12, x4);
-  cbnz(x12, done);
+  sub(x13, x12, x4);
+  cbnz(x13, release_cached_and_fail);
   ldr(w12, ptr(x19, static_cast<uint32_t>(
                         offsetof(A64BackendContext, cached_reserve_bit))));
-  sub(w12, w12, w7);
-  cbnz(w12, done);
+  sub(w13, w12, w7);
+  cbnz(w13, release_cached_and_fail);
 
   // Compare-and-swap the value: succeed iff memory still holds the value the
   // matching lwarx observed (A64BackendContext::cached_reserve_value_). casal
@@ -676,6 +698,17 @@ void* A64HelperEmitter::EmitReservedStoreHelper(bool bit64) {
   mov(x15, static_cast<uint64_t>(1));
   lsl(x15, x15, x7);
   ldclral(x15, x8, ptr(x4));
+
+  b(done);
+
+  L(release_cached_and_fail);
+  ldr(x12, ptr(x19, static_cast<uint32_t>(
+                        offsetof(A64BackendContext, cached_reserve_offset))));
+  ldr(w13, ptr(x19, static_cast<uint32_t>(
+                        offsetof(A64BackendContext, cached_reserve_bit))));
+  mov(x15, static_cast<uint64_t>(1));
+  lsl(x15, x15, x13);
+  ldclral(x15, x8, ptr(x12));
 
   L(done);
   ret();
@@ -714,12 +747,61 @@ void ReserveOffsetAndBit(ReserveHelper* reserve_helper, uint32_t guest_address,
   out_bit = block_idx & 63;
 }
 
+void ClearReservationBit(volatile uint64_t* block, uint32_t bit) {
+  if (!block) {
+    return;
+  }
+  const uint64_t mask = uint64_t(1) << (bit & 63);
+  while (true) {
+    const uint64_t old = *block;
+    if ((old & mask) == 0) {
+      break;
+    }
+    if (xe::atomic_cas(old, old & ~mask,
+                       reinterpret_cast<volatile uint64_t*>(block))) {
+      break;
+    }
+  }
+}
+
+void ClearCachedReservationBit(A64BackendContext* bctx) {
+  ClearReservationBit(reinterpret_cast<volatile uint64_t*>(
+                          uintptr_t(bctx->cached_reserve_offset)),
+                      bctx->cached_reserve_bit);
+}
+
+void ReleaseCachedReservation(A64BackendContext* bctx) {
+  const uint32_t reserve_flag = 1u << kA64BackendHasReserveBit;
+  if ((bctx->flags & reserve_flag) == 0) {
+    return;
+  }
+  ClearCachedReservationBit(bctx);
+  bctx->flags &= ~reserve_flag;
+}
+
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+constexpr uint32_t kIOSA64DynamicResolveLogLimit = 192;
+std::atomic<uint32_t> ios_a64_dynamic_resolve_log_count{0};
+
+bool BeginIOSA64DynamicResolveLog(uint32_t& log_index) {
+  log_index =
+      ios_a64_dynamic_resolve_log_count.fetch_add(1, std::memory_order_relaxed);
+  if (log_index < kIOSA64DynamicResolveLogLimit) {
+    return true;
+  }
+  if (log_index == kIOSA64DynamicResolveLogLimit) {
+    XELOGI("iOS A64: suppressing further dynamic resolve logs");
+  }
+  return false;
+}
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
+
 extern "C" uint64_t TryAcquireReservationHelper(void* raw_context,
                                                 uint64_t guest_address) {
   auto* bctx = BackendContextFromRawContext(raw_context);
   const uint32_t reserve_flag = 1u << kA64BackendHasReserveBit;
   // PPC lwarx implicitly drops any prior reservation.
-  bctx->flags &= ~reserve_flag;
+  ReleaseCachedReservation(bctx);
 
   volatile uint64_t* block;
   uint32_t bit;
@@ -769,6 +851,7 @@ uint64_t ReservedStoreImpl(void* raw_context, uint64_t guest_address,
   if (bctx->cached_reserve_offset != reinterpret_cast<uintptr_t>(block) ||
       bctx->cached_reserve_bit != bit) {
     assert_always();
+    ClearCachedReservationBit(bctx);
     return 0;
   }
 
@@ -786,17 +869,7 @@ uint64_t ReservedStoreImpl(void* raw_context, uint64_t guest_address,
   // Clear our reservation bit even if exchange failed — PPC stwcx. always
   // releases. If it's already clear (another thread invalidated us), the
   // exchange will have failed and we'll return 0.
-  const uint64_t mask = uint64_t(1) << bit;
-  while (true) {
-    const uint64_t old = *block;
-    if ((old & mask) == 0) {
-      break;
-    }
-    if (xe::atomic_cas(old, old & ~mask,
-                       reinterpret_cast<volatile uint64_t*>(block))) {
-      break;
-    }
-  }
+  ClearReservationBit(block, bit);
 
   return exchange_ok ? 1 : 0;
 }
@@ -826,6 +899,19 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   auto guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
   auto thread_state = guest_context->thread_state;
   assert_not_zero(target_address);
+
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  uint32_t ios_log_index = 0;
+  const bool ios_log = BeginIOSA64DynamicResolveLog(ios_log_index);
+  if (ios_log) {
+    XELOGI(
+        "iOS A64: dynamic resolve[{}] target={:08X} thid={:08X} "
+        "r1={:08X} lr={:08X}",
+        ios_log_index, static_cast<uint32_t>(target_address),
+        thread_state ? thread_state->thread_id() : 0,
+        uint32_t(guest_context->r[1]), uint32_t(guest_context->lr));
+  }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 
   // Longjmp re-entry: resume inside an existing function frame instead of
   // re-running its prolog. Mirrors x64_emitter.cc::ResolveFunction.
@@ -858,6 +944,15 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
                 static_cast<uint32_t>(target_address));
             if (sync_depth != 0) {
               backend_context->pending_stackpoint_sync_depth = sync_depth;
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+              if (ios_log) {
+                XELOGI(
+                    "iOS A64: dynamic resolve[{}] stack-sync target={:08X} "
+                    "host={:p} depth={}",
+                    ios_log_index, static_cast<uint32_t>(target_address),
+                    reinterpret_cast<const void*>(host_address), sync_depth);
+              }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
               return host_address;
             }
             break;
@@ -871,14 +966,33 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
       static_cast<uint32_t>(target_address));
   if (!fn) {
     // Unresolvable — return 0 which will fault.
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    if (ios_log) {
+      XELOGE("iOS A64: dynamic resolve[{}] failed target={:08X}", ios_log_index,
+             static_cast<uint32_t>(target_address));
+    }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     return 0;
   }
 
   auto guest_fn = static_cast<GuestFunction*>(fn);
   auto code = guest_fn->machine_code();
   if (!code) {
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    if (ios_log) {
+      XELOGE("iOS A64: dynamic resolve[{}] missing code target={:08X}",
+             ios_log_index, static_cast<uint32_t>(target_address));
+    }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     return 0;
   }
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  if (ios_log) {
+    XELOGI("iOS A64: dynamic resolve[{}] ready guest={:08X}-{:08X} code={:p}",
+           ios_log_index, guest_fn->address(), guest_fn->end_address(),
+           static_cast<const void*>(code));
+  }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
   return reinterpret_cast<uint64_t>(code);
 }
 

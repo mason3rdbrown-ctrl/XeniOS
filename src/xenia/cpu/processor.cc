@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/processor.h"
 
+#include <atomic>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/atomic.h"
 #include "xenia/base/byte_order.h"
@@ -64,6 +66,29 @@ using xe::cpu::ppc::PPCOpcode;
 using xe::kernel::XThread;
 
 using namespace xe::literals;
+
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+namespace {
+constexpr uint32_t kIOSGuestResolveLogLimit = 192;
+std::atomic<uint32_t> ios_guest_resolve_log_count{0};
+
+bool BeginIOSGuestResolveLog(ThreadState*& thread_state, uint32_t& log_index) {
+  thread_state = ThreadState::Get();
+  if (!thread_state) {
+    return false;
+  }
+  log_index =
+      ios_guest_resolve_log_count.fetch_add(1, std::memory_order_relaxed);
+  if (log_index < kIOSGuestResolveLogLimit) {
+    return true;
+  }
+  if (log_index == kIOSGuestResolveLogLimit) {
+    XELOGI("iOS A64: suppressing further guest function resolve logs");
+  }
+  return false;
+}
+}  // namespace
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 
 class BuiltinModule : public Module {
  public:
@@ -258,6 +283,21 @@ void Processor::RemoveFunctionByAddress(uint32_t address) {
 }
 
 Function* Processor::ResolveFunction(uint32_t address) {
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  ThreadState* ios_thread_state = nullptr;
+  uint32_t ios_log_index = 0;
+  const bool ios_log = BeginIOSGuestResolveLog(ios_thread_state, ios_log_index);
+  if (ios_log) {
+    auto* context = ios_thread_state->context();
+    XELOGI(
+        "iOS A64: resolve[{}] request guest={:08X} thid={:08X} "
+        "r1={:08X} lr={:08X}",
+        ios_log_index, address, ios_thread_state->thread_id(),
+        context ? uint32_t(context->r[1]) : 0,
+        context ? uint32_t(context->lr) : 0);
+  }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
+
   Entry* entry;
   Entry::Status status = entry_table_.GetOrCreate(address, &entry);
   if (status == Entry::STATUS_NEW) {
@@ -267,11 +307,23 @@ Function* Processor::ResolveFunction(uint32_t address) {
     auto function = LookupFunction(address);
 
     if (!function) {
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+      if (ios_log) {
+        XELOGE("iOS A64: resolve[{}] lookup failed guest={:08X}", ios_log_index,
+               address);
+      }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
       entry_table_.MarkFailed(entry);
       return nullptr;
     }
 
     if (!DemandFunction(function)) {
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+      if (ios_log) {
+        XELOGE("iOS A64: resolve[{}] define failed guest={:08X}", ios_log_index,
+               address);
+      }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
       entry_table_.MarkFailed(entry);
       return nullptr;
     }
@@ -291,9 +343,27 @@ Function* Processor::ResolveFunction(uint32_t address) {
   }
   if (status == Entry::STATUS_READY) {
     // Ready to use.
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    if (ios_log) {
+      const void* machine_code = nullptr;
+      if (entry->function->is_guest()) {
+        machine_code =
+            static_cast<GuestFunction*>(entry->function)->machine_code();
+      }
+      XELOGI("iOS A64: resolve[{}] ready guest={:08X}-{:08X} code={:p}",
+             ios_log_index, entry->function->address(),
+             entry->function->end_address(), machine_code);
+    }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     return entry->function;
   } else {
     // Failed or bad state.
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    if (ios_log) {
+      XELOGE("iOS A64: resolve[{}] bad state guest={:08X} status={}",
+             ios_log_index, address, static_cast<int>(status));
+    }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     return nullptr;
   }
 }
