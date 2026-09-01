@@ -50,7 +50,7 @@ bool IsIOSExecutableEntryFunction(xe::cpu::GuestFunction* function) {
   }
 
   uint32_t entry_point = 0;
-  if (!xex_module->GetOptHeader(XEX_HEADER_ENTRY_POINT, &entry_point)) {
+  if (!xex_module->GetOptHeader(xe::XEX_HEADER_ENTRY_POINT, &entry_point)) {
     return false;
   }
 
