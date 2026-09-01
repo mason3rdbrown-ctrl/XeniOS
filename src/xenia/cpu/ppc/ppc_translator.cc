@@ -14,6 +14,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/memory.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/reset_scope.h"
 #include "xenia/base/string.h"
@@ -35,6 +36,28 @@ DEFINE_bool(disable_context_promotion, false,
             "CPU");
 
 DECLARE_bool(debug);
+
+namespace {
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+bool IsIOSExecutableEntryFunction(xe::cpu::GuestFunction* function) {
+  if (!function) {
+    return false;
+  }
+
+  auto* xex_module = dynamic_cast<xe::cpu::XexModule*>(function->module());
+  if (!xex_module) {
+    return false;
+  }
+
+  uint32_t entry_point = 0;
+  if (!xex_module->GetOptHeader(XEX_HEADER_ENTRY_POINT, &entry_point)) {
+    return false;
+  }
+
+  return function->address() == entry_point;
+}
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
+}  // namespace
 
 namespace xe {
 namespace cpu {
@@ -221,6 +244,15 @@ bool PPCTranslator::Translate(GuestFunction* function,
   if (!scanner_->Scan(function, debug_info.get())) {
     return false;
   }
+
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  if (IsIOSExecutableEntryFunction(function)) {
+    StringBuffer source_log;
+    DumpSource(function, &source_log);
+    XELOGI("iOS PPC: executable entry disassembly\n{}",
+           source_log.to_string_view());
+  }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 
   // Setup trace data, if needed.
   if (debug_info_flags & DebugInfoFlags::kDebugInfoTraceFunctions) {

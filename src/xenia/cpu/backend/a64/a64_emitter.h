@@ -201,6 +201,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
 #if XE_PLATFORM_IOS && XE_ARCH_ARM64
   void EmitTitleStopPollIOS();
+  void EmitIOSA64ExternCallTrace(const Function* function, bool is_return);
 #endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 
  protected:

@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/backend/a64/a64_emitter.h"
 
+#include <atomic>
 #include <cstring>
 
 #include "xenia/base/debugging.h"
@@ -36,6 +37,55 @@ DECLARE_bool(a64_enable_host_guest_stack_synchronization);
 namespace {
 
 #if XE_PLATFORM_IOS && XE_ARCH_ARM64
+constexpr uint32_t kIOSA64ExternTraceLogLimit = 128;
+
+std::atomic<uint32_t> ios_a64_extern_trace_log_count{0};
+
+bool IsIOSExecutableEntryFunction(xe::cpu::GuestFunction* function) {
+  if (!function) {
+    return false;
+  }
+
+  auto* xex_module = dynamic_cast<xe::cpu::XexModule*>(function->module());
+  if (!xex_module) {
+    return false;
+  }
+
+  uint32_t entry_point = 0;
+  if (!xex_module->GetOptHeader(XEX_HEADER_ENTRY_POINT, &entry_point)) {
+    return false;
+  }
+
+  return function->address() == entry_point;
+}
+
+void TraceIOSA64ExternCall(void* raw_context, uint64_t function_ptr,
+                           uint64_t is_return) {
+  auto* context = reinterpret_cast<xe::cpu::ppc::PPCContext*>(raw_context);
+  auto* function =
+      reinterpret_cast<const xe::cpu::Function*>(uintptr_t(function_ptr));
+  uint32_t log_index =
+      ios_a64_extern_trace_log_count.fetch_add(1, std::memory_order_relaxed);
+  if (log_index >= kIOSA64ExternTraceLogLimit) {
+    if (log_index == kIOSA64ExternTraceLogLimit) {
+      XELOGI("iOS A64: suppressing further extern-call logs");
+    }
+    return;
+  }
+
+  XELOGI(
+      "iOS A64: extern[{}] {} guest={:08X} name='{}' thid={:08X} "
+      "r1={:08X} r3={:08X} r4={:08X} lr={:08X} ctr={:08X}",
+      log_index, is_return ? "return" : "enter",
+      function ? function->address() : 0,
+      function ? function->name().c_str() : "<null>",
+      context ? context->thread_id : 0, context ? uint32_t(context->r[1]) : 0,
+      context ? uint32_t(context->r[3]) : 0,
+      context ? uint32_t(context->r[4]) : 0,
+      context ? uint32_t(context->lr) : 0,
+      context ? uint32_t(context->ctr) : 0);
+}
+
 void ExitCurrentGuestThreadForTitleStopIOS(xe::cpu::ppc::PPCContext* context) {
   if (!context || !context->processor ||
       !context->processor->title_stop_requested_ios() ||
@@ -109,6 +159,13 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   trace_data_ = &function->trace_data();
 
   current_guest_function_ = function->address();
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  if (IsIOSExecutableEntryFunction(function)) {
+    ios_a64_extern_trace_log_count.store(0, std::memory_order_relaxed);
+    XELOGI("iOS A64: tracing executable entry host-call edges guest={:08X}",
+           current_guest_function_);
+  }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 
   // Reset state.
   stack_size_ = StackLayout::GUEST_STACK_SIZE;
@@ -317,6 +374,13 @@ void A64Emitter::EmitTitleStopPollIOS() {
   b(epilog_label());
 
   L(continue_execution);
+}
+
+void A64Emitter::EmitIOSA64ExternCallTrace(const Function* function,
+                                           bool is_return) {
+  mov(x1, reinterpret_cast<uint64_t>(function));
+  mov(x2, is_return ? 1 : 0);
+  CallNativeSafe(reinterpret_cast<void*>(&TraceIOSA64ExternCall));
 }
 #endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 
@@ -746,6 +810,9 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
     auto builtin_function = static_cast<const BuiltinFunction*>(function);
     if (builtin_function->handler()) {
       undefined = false;
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+      EmitIOSA64ExternCallTrace(function, false);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
       // GuestToHostThunk: x0=target, x1=arg0, x2=arg1
       // Thunk rearranges to: x0=context, x1=arg0, x2=arg1, calls target
       mov(x0, reinterpret_cast<uint64_t>(builtin_function->handler()));
@@ -753,23 +820,38 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
       mov(x2, reinterpret_cast<uint64_t>(builtin_function->arg1()));
       mov(x9, reinterpret_cast<uint64_t>(backend()->guest_to_host_thunk()));
       blr(x9);
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+      EmitIOSA64ExternCallTrace(function, true);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     }
   } else if (function->behavior() == Function::Behavior::kExtern) {
     auto extern_function = static_cast<const GuestFunction*>(function);
     if (extern_function->extern_handler()) {
       undefined = false;
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+      EmitIOSA64ExternCallTrace(function, false);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
       // GuestToHostThunk: x0=target, x1=arg0
       mov(x0, reinterpret_cast<uint64_t>(extern_function->extern_handler()));
       ldr(x1, ptr(GetContextReg(), static_cast<int32_t>(offsetof(
                                        ppc::PPCContext, kernel_state))));
       mov(x9, reinterpret_cast<uint64_t>(backend()->guest_to_host_thunk()));
       blr(x9);
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+      EmitIOSA64ExternCallTrace(function, true);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     }
   }
   if (undefined) {
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    EmitIOSA64ExternCallTrace(function, false);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     // Set arg0 = function pointer, then call UndefinedCallExtern via thunk.
     mov(x1, reinterpret_cast<uint64_t>(function));
     CallNativeSafe(reinterpret_cast<void*>(&UndefinedCallExtern));
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    EmitIOSA64ExternCallTrace(function, true);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
   }
 }
 
