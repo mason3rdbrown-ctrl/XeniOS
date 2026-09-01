@@ -38,8 +38,14 @@ namespace {
 
 #if XE_PLATFORM_IOS && XE_ARCH_ARM64
 constexpr uint32_t kIOSA64ExternTraceLogLimit = 128;
+constexpr uint32_t kIOSA64GuestCallTraceLogLimit = 256;
+constexpr uint32_t kIOSA64GuestCallTraceReturn = 1u << 0;
+constexpr uint32_t kIOSA64GuestCallTraceTail = 1u << 1;
+constexpr uint32_t kIOSA64GuestCallTraceIndirect = 1u << 2;
+constexpr uint32_t kIOSA64GuestCallTraceSaverest = 1u << 3;
 
 std::atomic<uint32_t> ios_a64_extern_trace_log_count{0};
+std::atomic<uint32_t> ios_a64_guest_call_trace_log_count{0};
 
 bool IsIOSExecutableEntryFunction(xe::cpu::GuestFunction* function) {
   if (!function) {
@@ -57,6 +63,47 @@ bool IsIOSExecutableEntryFunction(xe::cpu::GuestFunction* function) {
   }
 
   return function->address() == entry_point;
+}
+
+uint64_t MakeIOSA64GuestCallTracePayload(uint32_t target_address,
+                                         bool is_return, bool is_tail_call,
+                                         bool is_indirect, bool is_saverest) {
+  uint32_t flags = 0;
+  flags |= is_return ? kIOSA64GuestCallTraceReturn : 0;
+  flags |= is_tail_call ? kIOSA64GuestCallTraceTail : 0;
+  flags |= is_indirect ? kIOSA64GuestCallTraceIndirect : 0;
+  flags |= is_saverest ? kIOSA64GuestCallTraceSaverest : 0;
+  return uint64_t(target_address) | (uint64_t(flags) << 32);
+}
+
+void TraceIOSA64GuestCall(void* raw_context, uint64_t caller_address,
+                          uint64_t target_and_flags) {
+  auto* context = reinterpret_cast<xe::cpu::ppc::PPCContext*>(raw_context);
+  const uint32_t target_address = uint32_t(target_and_flags);
+  const uint32_t flags = uint32_t(target_and_flags >> 32);
+  uint32_t log_index = ios_a64_guest_call_trace_log_count.fetch_add(
+      1, std::memory_order_relaxed);
+  if (log_index >= kIOSA64GuestCallTraceLogLimit) {
+    if (log_index == kIOSA64GuestCallTraceLogLimit) {
+      XELOGI("iOS A64: suppressing further guest-call logs");
+    }
+    return;
+  }
+
+  XELOGI(
+      "iOS A64: guest-call[{}] {} caller={:08X} target={:08X} "
+      "tail={} indirect={} saverest={} thid={:08X} r1={:08X} "
+      "r3={:08X} r4={:08X} lr={:08X} ctr={:08X}",
+      log_index, (flags & kIOSA64GuestCallTraceReturn) ? "return" : "enter",
+      uint32_t(caller_address), target_address,
+      (flags & kIOSA64GuestCallTraceTail) ? 1 : 0,
+      (flags & kIOSA64GuestCallTraceIndirect) ? 1 : 0,
+      (flags & kIOSA64GuestCallTraceSaverest) ? 1 : 0,
+      context ? context->thread_id : 0, context ? uint32_t(context->r[1]) : 0,
+      context ? uint32_t(context->r[3]) : 0,
+      context ? uint32_t(context->r[4]) : 0,
+      context ? uint32_t(context->lr) : 0,
+      context ? uint32_t(context->ctr) : 0);
 }
 
 void TraceIOSA64ExternCall(void* raw_context, uint64_t function_ptr,
@@ -162,6 +209,7 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
 #if XE_PLATFORM_IOS && XE_ARCH_ARM64
   if (IsIOSExecutableEntryFunction(function)) {
     ios_a64_extern_trace_log_count.store(0, std::memory_order_relaxed);
+    ios_a64_guest_call_trace_log_count.store(0, std::memory_order_relaxed);
     XELOGI("iOS A64: tracing executable entry host-call edges guest={:08X}",
            current_guest_function_);
   }
@@ -357,6 +405,30 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
 }
 
 #if XE_PLATFORM_IOS && XE_ARCH_ARM64
+void A64Emitter::EmitIOSA64GuestCallTrace(uint32_t target_address,
+                                          bool is_return, bool is_tail_call,
+                                          bool is_indirect, bool is_saverest) {
+  mov(x1, static_cast<uint64_t>(current_guest_function_));
+  mov(x2,
+      MakeIOSA64GuestCallTracePayload(target_address, is_return, is_tail_call,
+                                      is_indirect, is_saverest));
+  CallNativeSafe(reinterpret_cast<void*>(&TraceIOSA64GuestCall));
+}
+
+void A64Emitter::EmitIOSA64GuestCallTraceInW16(bool is_return,
+                                               bool is_tail_call,
+                                               bool is_indirect,
+                                               bool is_saverest) {
+  str(w16, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RESERVED)));
+  mov(x1, static_cast<uint64_t>(current_guest_function_));
+  ldr(w2, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RESERVED)));
+  mov(x15, MakeIOSA64GuestCallTracePayload(0, is_return, is_tail_call,
+                                           is_indirect, is_saverest));
+  orr(x2, x2, x15);
+  CallNativeSafe(reinterpret_cast<void*>(&TraceIOSA64GuestCall));
+  ldr(w16, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RESERVED)));
+}
+
 void A64Emitter::EmitTitleStopPollIOS() {
   const uintptr_t stop_word =
       processor_ ? processor_->title_stop_requested_address_ios() : 0;
@@ -515,7 +587,19 @@ void A64Emitter::UnimplementedInstr(const hir::Instr* i) {
 void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   assert_not_null(function);
   ForgetFpcrMode();
+  const bool is_tail_call = (instr->flags & hir::CALL_TAIL) != 0;
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  const bool is_saverest = function->IsSaverest();
+  EmitIOSA64GuestCallTrace(function->address(), false, is_tail_call, false,
+                           is_saverest);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
   if (TryInlinePPCGprLrSaveRestore(instr, function)) {
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    if (!is_tail_call) {
+      EmitIOSA64GuestCallTrace(function->address(), true, is_tail_call, false,
+                               is_saverest);
+    }
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     return;
   }
 
@@ -524,10 +608,14 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   if (fn->machine_code()) {
     // Direct call — function is already compiled.
     mov(x9, reinterpret_cast<uint64_t>(fn->machine_code()));
-    if (!(instr->flags & hir::CALL_TAIL)) {
+    if (!is_tail_call) {
       // Pass the next call's guest return address in x0.
       ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
       blr(x9);
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+      EmitIOSA64GuestCallTrace(function->address(), true, false, false,
+                               is_saverest);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
       synchronize_stack_on_next_instruction_ = true;
     } else {
       // Tail call: pass our return address to the callee.
@@ -586,7 +674,7 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     mov(x9, x0);  // resolved address in x9
   }
 
-  if (instr->flags & hir::CALL_TAIL) {
+  if (is_tail_call) {
     PopStackpoint();
     ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
     ldr(x30, ptr(sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
@@ -600,11 +688,18 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   } else {
     ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
     blr(x9);
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    EmitIOSA64GuestCallTrace(function->address(), true, false, false,
+                             is_saverest);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     synchronize_stack_on_next_instruction_ = true;
   }
 }
 
 void A64Emitter::TailCallGuestAddressInW16() {
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  EmitIOSA64GuestCallTraceInW16(false, true, true, false);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
   if (code_cache_->has_indirection_table()) {
     // Must leave the guest address in w16 for the resolve thunk to read.
     if (!code_cache_->encoded_indirection()) {
@@ -729,21 +824,28 @@ bool A64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
 void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
   ForgetFpcrMode();
   auto target_w = WReg(reg_index);
+  const bool is_tail_call = (instr->flags & hir::CALL_TAIL) != 0;
+
+  if (target_w.getIdx() != w16.getIdx()) {
+    mov(w16, target_w);
+  }
 
   // Check if this is a possible return (e.g., PPC blr).
   if (instr->flags & hir::CALL_POSSIBLE_RETURN) {
     // Compare target guest address with our function's return address.
     ldr(w0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
-    cmp(target_w, w0);
+    cmp(w16, w0);
     b(EQ, epilog_label());
   }
+
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  str(w16, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RESERVED)));
+  EmitIOSA64GuestCallTraceInW16(false, is_tail_call, true, false);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 
   // Load host code address from indirection table.
   if (code_cache_->has_indirection_table()) {
     // Must leave the guest address in w16 for the resolve thunk to read.
-    if (target_w.getIdx() != w16.getIdx()) {
-      mov(w16, target_w);
-    }
     if (!code_cache_->encoded_indirection()) {
       // Fast path: table mapped at host VA == guest addr; slot holds raw
       // 32-bit host target.
@@ -783,7 +885,7 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     mov(x9, x0);  // resolved address
   }
 
-  if (instr->flags & hir::CALL_TAIL) {
+  if (is_tail_call) {
     // Tail call: pass our return address to the callee.
     PopStackpoint();
     ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
@@ -799,6 +901,10 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     // Regular call: pass the next call's return address.
     ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
     blr(x9);
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    ldr(w16, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RESERVED)));
+    EmitIOSA64GuestCallTraceInW16(true, false, true, false);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
     synchronize_stack_on_next_instruction_ = true;
   }
 }
