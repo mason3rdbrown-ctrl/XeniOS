@@ -201,6 +201,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
 #if XE_PLATFORM_IOS && XE_ARCH_ARM64
   void EmitTitleStopPollIOS();
+  void EmitIOSA64EntryProgressMarker(uint32_t stage, uint32_t marker);
   void EmitIOSA64GuestCallTrace(uint32_t target_address, bool is_return,
                                 bool is_tail_call, bool is_indirect,
                                 bool is_saverest);
@@ -240,6 +241,9 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
   FPCRMode fpcr_mode_ = FPCRMode::Unknown;
   bool synchronize_stack_on_next_instruction_ = false;
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  bool ios_trace_executable_entry_function_ = false;
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 };
 
 }  // namespace a64

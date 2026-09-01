@@ -10,7 +10,9 @@
 #include "xenia/cpu/backend/a64/a64_emitter.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
@@ -43,9 +45,16 @@ constexpr uint32_t kIOSA64GuestCallTraceReturn = 1u << 0;
 constexpr uint32_t kIOSA64GuestCallTraceTail = 1u << 1;
 constexpr uint32_t kIOSA64GuestCallTraceIndirect = 1u << 2;
 constexpr uint32_t kIOSA64GuestCallTraceSaverest = 1u << 3;
+constexpr uint32_t kIOSA64EntryProgressStageFunctionEntry = 1;
+constexpr uint32_t kIOSA64EntryProgressStageBlockEnter = 2;
+constexpr uint32_t kIOSA64EntryProgressStagePostTitleStopPoll = 3;
+constexpr uint32_t kIOSA64EntryProgressStageSourceOffset = 4;
+constexpr uint32_t kIOSA64EntryProgressStageGuestCallTrace = 5;
 
 std::atomic<uint32_t> ios_a64_extern_trace_log_count{0};
 std::atomic<uint32_t> ios_a64_guest_call_trace_log_count{0};
+std::atomic<uint64_t> ios_a64_entry_progress_state{0};
+std::atomic<uint32_t> ios_a64_entry_progress_monitor_generation{0};
 
 bool IsIOSExecutableEntryFunction(xe::cpu::GuestFunction* function) {
   if (!function) {
@@ -74,6 +83,75 @@ uint64_t MakeIOSA64GuestCallTracePayload(uint32_t target_address,
   flags |= is_indirect ? kIOSA64GuestCallTraceIndirect : 0;
   flags |= is_saverest ? kIOSA64GuestCallTraceSaverest : 0;
   return uint64_t(target_address) | (uint64_t(flags) << 32);
+}
+
+uint64_t MakeIOSA64EntryProgressPayload(uint32_t stage, uint32_t marker) {
+  return uint64_t(marker) | (uint64_t(stage) << 32);
+}
+
+const char* IOSA64EntryProgressStageName(uint32_t stage) {
+  switch (stage) {
+    case kIOSA64EntryProgressStageFunctionEntry:
+      return "function-entry";
+    case kIOSA64EntryProgressStageBlockEnter:
+      return "block-enter";
+    case kIOSA64EntryProgressStagePostTitleStopPoll:
+      return "post-title-stop-poll";
+    case kIOSA64EntryProgressStageSourceOffset:
+      return "source-offset";
+    case kIOSA64EntryProgressStageGuestCallTrace:
+      return "guest-call-trace";
+    default:
+      return "unknown";
+  }
+}
+
+void StartIOSA64EntryProgressMonitor(uint32_t guest_function) {
+  ios_a64_entry_progress_state.store(0, std::memory_order_release);
+  const uint32_t generation =
+      ios_a64_entry_progress_monitor_generation.fetch_add(
+          1, std::memory_order_acq_rel) +
+      1;
+
+  std::thread([generation, guest_function]() {
+    uint64_t last_state = 0;
+    bool saw_marker = false;
+    for (uint32_t poll = 0; poll < 2000; ++poll) {
+      if (ios_a64_entry_progress_monitor_generation.load(
+              std::memory_order_acquire) != generation) {
+        return;
+      }
+
+      const uint64_t state =
+          ios_a64_entry_progress_state.load(std::memory_order_acquire);
+      if (state != last_state) {
+        last_state = state;
+        saw_marker = state != 0;
+        const uint32_t marker = uint32_t(state);
+        const uint32_t stage = uint32_t(state >> 32);
+        XELOGI(
+            "iOS A64: entry-progress monitor guest={:08X} stage={} "
+            "marker={:08X}",
+            guest_function, IOSA64EntryProgressStageName(stage), marker);
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    if (!saw_marker) {
+      XELOGW(
+          "iOS A64: entry-progress monitor saw no generated-code markers "
+          "guest={:08X}",
+          guest_function);
+    } else {
+      const uint32_t marker = uint32_t(last_state);
+      const uint32_t stage = uint32_t(last_state >> 32);
+      XELOGI(
+          "iOS A64: entry-progress monitor final guest={:08X} stage={} "
+          "marker={:08X}",
+          guest_function, IOSA64EntryProgressStageName(stage), marker);
+    }
+  }).detach();
 }
 
 void TraceIOSA64GuestCall(void* raw_context, uint64_t caller_address,
@@ -207,9 +285,11 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
 
   current_guest_function_ = function->address();
 #if XE_PLATFORM_IOS && XE_ARCH_ARM64
-  if (IsIOSExecutableEntryFunction(function)) {
+  ios_trace_executable_entry_function_ = IsIOSExecutableEntryFunction(function);
+  if (ios_trace_executable_entry_function_) {
     ios_a64_extern_trace_log_count.store(0, std::memory_order_relaxed);
     ios_a64_guest_call_trace_log_count.store(0, std::memory_order_relaxed);
+    StartIOSA64EntryProgressMonitor(current_guest_function_);
     XELOGI("iOS A64: tracing executable entry host-call edges guest={:08X}",
            current_guest_function_);
   }
@@ -293,6 +373,11 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   // Record stackpoint for longjmp recovery.
   PushStackpoint();
 
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  EmitIOSA64EntryProgressMarker(kIOSA64EntryProgressStageFunctionEntry,
+                                current_guest_function_);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
+
   // ========================================================================
   // BODY
   // ========================================================================
@@ -326,7 +411,11 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
     }
 
 #if XE_PLATFORM_IOS && XE_ARCH_ARM64
+    EmitIOSA64EntryProgressMarker(kIOSA64EntryProgressStageBlockEnter,
+                                  block->ordinal);
     EmitTitleStopPollIOS();
+    EmitIOSA64EntryProgressMarker(kIOSA64EntryProgressStagePostTitleStopPoll,
+                                  block->ordinal);
 #endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 
     // Process each instruction in the block.
@@ -408,11 +497,25 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
 void A64Emitter::EmitIOSA64GuestCallTrace(uint32_t target_address,
                                           bool is_return, bool is_tail_call,
                                           bool is_indirect, bool is_saverest) {
+  if (!is_return) {
+    EmitIOSA64EntryProgressMarker(kIOSA64EntryProgressStageGuestCallTrace,
+                                  target_address);
+  }
   mov(x1, static_cast<uint64_t>(current_guest_function_));
   mov(x2,
       MakeIOSA64GuestCallTracePayload(target_address, is_return, is_tail_call,
                                       is_indirect, is_saverest));
   CallNativeSafe(reinterpret_cast<void*>(&TraceIOSA64GuestCall));
+}
+
+void A64Emitter::EmitIOSA64EntryProgressMarker(uint32_t stage,
+                                               uint32_t marker) {
+  if (!ios_trace_executable_entry_function_) {
+    return;
+  }
+  mov(x14, reinterpret_cast<uint64_t>(&ios_a64_entry_progress_state));
+  mov(x15, MakeIOSA64EntryProgressPayload(stage, marker));
+  stlr(x15, ptr(x14));
 }
 
 void A64Emitter::EmitIOSA64GuestCallTraceInW16(bool is_return,
@@ -500,6 +603,10 @@ void A64Emitter::MarkSourceOffset(const hir::Instr* i) {
   entry->guest_address = static_cast<uint32_t>(i->src1.offset);
   entry->hir_offset = uint32_t(i->block->ordinal << 16) | i->ordinal;
   entry->code_offset = static_cast<uint32_t>(getSize());
+#if XE_PLATFORM_IOS && XE_ARCH_ARM64
+  EmitIOSA64EntryProgressMarker(kIOSA64EntryProgressStageSourceOffset,
+                                entry->guest_address);
+#endif  // XE_PLATFORM_IOS && XE_ARCH_ARM64
 }
 
 void A64Emitter::DebugBreak() { brk(0xF000); }
